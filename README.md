@@ -33,8 +33,7 @@ When you use `get_attachment`, images are returned as base64 content blocks that
 
 - **macOS** (this reads the local iMessage database)
 - **Node.js** >= 18
-- **Full Disk Access** granted to your terminal app (System Settings > Privacy & Security > Full Disk Access)
-- **Full Disk Access** also covers the AddressBook database used for contact name resolution (no need to have the Contacts app running)
+- **Full Disk Access** granted to your terminal app (System Settings > Privacy & Security > Full Disk Access). This covers both the iMessage database and the AddressBook database used for contact name resolution — no need to have the Contacts app running.
 
 ## Installation
 
@@ -84,7 +83,7 @@ Add to your `.mcp.json`:
 
 **"Show me my recent messages"** -- reads your latest conversations
 
-**"What did Mom text me today?"** -- looks up "Mom" in Contacts, finds the phone number, pulls the conversation
+**"What did Mom text me today?"** -- resolves "Mom" to a phone number via your AddressBook, pulls the conversation
 
 **"Search my messages for 'flight confirmation'"** -- full-text search across all messages
 
@@ -132,7 +131,7 @@ Contact resolution reads the macOS AddressBook SQLite databases directly (no Con
 Rebuild native dependencies: `npm rebuild`. This happens when your Node.js version changes. Also make sure your Claude Desktop config uses the full path to node (see Configuration above).
 
 **Missing messages from a conversation**
-This is exactly the bug this server fixes. If you're seeing it, make sure you're running v1.1.0+ which includes the `attributedBody` extraction.
+This is exactly the bug this server fixes. Make sure you're running the latest version which includes the `attributedBody` extraction.
 
 ## License
 
