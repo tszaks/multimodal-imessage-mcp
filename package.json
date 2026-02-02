@@ -1,6 +1,6 @@
 {
   "name": "multimodal-imessage-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "The most complete iMessage MCP server for Claude. Read conversations, search messages, view image attachments, send messages, and look up contacts. Solves the macOS attributedBody bug that breaks 93% of messages in other iMessage tools.",
   "main": "index.js",
   "bin": {
