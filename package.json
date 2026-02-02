@@ -1,0 +1,39 @@
+{
+  "name": "multimodal-imessage-mcp",
+  "version": "1.1.0",
+  "description": "The most complete iMessage MCP server for Claude. Read conversations, search messages, view image attachments, send messages, and look up contacts. Solves the macOS attributedBody bug that breaks 93% of messages in other iMessage tools.",
+  "main": "index.js",
+  "bin": {
+    "multimodal-imessage-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "imessage",
+    "messages",
+    "claude",
+    "multimodal",
+    "macos",
+    "apple",
+    "model-context-protocol",
+    "ai",
+    "attachments"
+  ],
+  "author": "Tyler Szakacs",
+  "license": "MIT",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tyszakacs/multimodal-imessage-mcp"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": ["darwin"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "better-sqlite3": "^12.6.2"
+  }
+}
