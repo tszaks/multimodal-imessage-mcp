@@ -34,7 +34,7 @@ When you use `get_attachment`, images are returned as base64 content blocks that
 - **macOS** (this reads the local iMessage database)
 - **Node.js** >= 18
 - **Full Disk Access** granted to your terminal app (System Settings > Privacy & Security > Full Disk Access)
-- **Contacts app** must be running for contact name lookups (the server will work without it, but `lookup_contact` and name-based `get_conversation` will fail)
+- **Full Disk Access** also covers the AddressBook database used for contact name resolution (no need to have the Contacts app running)
 
 ## Installation
 
@@ -125,8 +125,8 @@ iMessage attachments are stored in `~/Library/Messages/Attachments/` with paths 
 **"Failed to open iMessage database"**
 Grant Full Disk Access to your terminal app: System Settings > Privacy & Security > Full Disk Access.
 
-**Contact lookup fails**
-Open the Contacts app. The lookup uses AppleScript which requires Contacts to be running.
+**Contact lookup returns no results**
+Contact resolution reads the macOS AddressBook SQLite databases directly (no Contacts app needed). Make sure Full Disk Access is granted. If a contact was just added, restart the MCP server to refresh the cache.
 
 **Native module crash / "NODE_MODULE_VERSION mismatch"**
 Rebuild native dependencies: `npm rebuild`. This happens when your Node.js version changes. Also make sure your Claude Desktop config uses the full path to node (see Configuration above).
