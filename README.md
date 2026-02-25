@@ -38,7 +38,7 @@ When you use `get_attachment`, images are returned as base64 content blocks that
 ## Installation
 
 ```bash
-git clone https://github.com/tyszakacs/multimodal-imessage-mcp.git
+git clone https://github.com/tszaks/multimodal-imessage-mcp.git
 cd multimodal-imessage-mcp
 npm install
 ```
@@ -136,3 +136,38 @@ This is exactly the bug this server fixes. Make sure you're running the latest v
 ## License
 
 MIT
+
+## Quickstart TL;DR
+
+```bash
+npm install
+node index.js
+```
+
+Then add the server to your MCP client config and grant Full Disk Access to your terminal app.
+
+## How It Works (TL;DR)
+
+- Reads macOS iMessage SQLite database
+- Decodes modern `attributedBody` payloads for complete message text
+- Exposes conversation/search/attachment tools via MCP
+- Uses AppleScript for message send/reaction actions with explicit confirmations
+
+## LLM Quick Copy
+
+Use the copy button on this code block in GitHub.
+
+```txt
+Repo: multimodal-imessage-mcp
+Goal: Full iMessage MCP including attachments and send/reaction actions.
+Setup:
+1) npm install
+2) Grant Full Disk Access to terminal app
+3) Add MCP config entry for index.js
+Use:
+- read_recent_messages, search_messages, get_conversation
+- get_attachment for image/file analysis
+- send_message/react_to_message with explicit confirm flag
+How it works:
+- SQLite + attributedBody decoding + AppleScript actions wrapped as MCP tools
+```
