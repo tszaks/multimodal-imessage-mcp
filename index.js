@@ -20,7 +20,7 @@ class IMessageServer {
     this.server = new Server(
       {
         name: 'imessage-server',
-        version: '1.2.0',
+        version: '1.3.0',
       },
       {
         capabilities: {
@@ -192,7 +192,7 @@ class IMessageServer {
         },
         {
           name: 'send_message',
-          description: 'Send an iMessage to a contact (uses AppleScript). IMPORTANT: Always show the user the message content and recipient before sending, and get explicit confirmation.',
+          description: 'Send an iMessage or SMS to a contact (uses AppleScript). Supports iMessage (blue bubble), SMS (green bubble), or auto-detection. IMPORTANT: Always show the user the message content and recipient before sending, and get explicit confirmation.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -203,6 +203,12 @@ class IMessageServer {
               message: {
                 type: 'string',
                 description: 'Message text to send',
+              },
+              service: {
+                type: 'string',
+                description: 'Messaging service to use: "auto" (try iMessage first, fall back to SMS), "imessage" (force iMessage/blue bubble), "sms" (force SMS/green bubble). Defaults to "auto".',
+                enum: ['auto', 'imessage', 'sms'],
+                default: 'auto',
               },
               confirm: {
                 type: 'boolean',
@@ -924,8 +930,18 @@ class IMessageServer {
     return { content: contentBlocks };
   }
 
+  buildSendScript(sanitizedTo, sanitizedMessage, serviceType) {
+    return `
+      tell application "Messages"
+        set targetService to 1st account whose service type = ${serviceType}
+        set targetBuddy to participant "${sanitizedTo}" of targetService
+        send "${sanitizedMessage}" to targetBuddy
+      end tell
+    `;
+  }
+
   async sendMessage(args) {
-    let { to, message, confirm } = args;
+    let { to, message, confirm, service = 'auto' } = args;
 
     // Resolve contact name to phone/email if needed
     const looksLikeId = to.includes('@') || to.includes('+') || /^\d{7,}$/.test(to);
@@ -948,11 +964,12 @@ class IMessageServer {
     }
 
     if (!confirm) {
+      const serviceLabel = service === 'sms' ? 'SMS (green bubble)' : service === 'imessage' ? 'iMessage (blue bubble)' : 'iMessage or SMS (auto)';
       return {
         content: [
           {
             type: 'text',
-            text: `Message NOT sent. Confirmation required.\n\nTo: ${to}\nMessage: "${message}"\n\nTo send this message, set confirm=true.`,
+            text: `Message NOT sent. Confirmation required.\n\nTo: ${to}\nMessage: "${message}"\nService: ${serviceLabel}\n\nTo send this message, set confirm=true.`,
           },
         ],
       };
@@ -961,26 +978,37 @@ class IMessageServer {
     const sanitizedTo = to.replace(/["'\\]/g, '');
     const sanitizedMessage = message.replace(/"/g, '\\"');
 
-    const script = `
-      tell application "Messages"
-        set targetService to 1st account whose service type = iMessage
-        set targetBuddy to participant "${sanitizedTo}" of targetService
-        send "${sanitizedMessage}" to targetBuddy
-      end tell
-    `;
+    const runScript = (script) => execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`);
 
+    if (service === 'imessage') {
+      try {
+        runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
+        return { content: [{ type: 'text', text: `iMessage sent to ${to}: "${message}"` }] };
+      } catch (error) {
+        throw new Error(`Failed to send iMessage: ${error.message}`);
+      }
+    }
+
+    if (service === 'sms') {
+      try {
+        runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
+        return { content: [{ type: 'text', text: `SMS sent to ${to}: "${message}"` }] };
+      } catch (error) {
+        throw new Error(`Failed to send SMS: ${error.message}. Make sure your iPhone is nearby and Bluetooth is on (required for SMS relay).`);
+      }
+    }
+
+    // auto: try iMessage first, fall back to SMS
     try {
-      execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Message sent to ${to}: "${message}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      throw new Error(`Failed to send message: ${error.message}`);
+      runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
+      return { content: [{ type: 'text', text: `iMessage sent to ${to}: "${message}"` }] };
+    } catch {
+      try {
+        runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
+        return { content: [{ type: 'text', text: `SMS sent to ${to}: "${message}" (sent as SMS — recipient may not have iMessage)` }] };
+      } catch (smsError) {
+        throw new Error(`Failed to send as iMessage or SMS: ${smsError.message}. For SMS, ensure your iPhone is nearby with Bluetooth on.`);
+      }
     }
   }
 
@@ -1170,7 +1198,7 @@ class IMessageServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('iMessage MCP server v1.2.0 running on stdio');
+    console.error('iMessage MCP server v1.3.0 running on stdio');
   }
 }
 
