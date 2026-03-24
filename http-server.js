@@ -2,7 +2,7 @@
 // imessage-mcp HTTP server — self-contained HTTP wrapper
 // Wraps the iMessage functionality in an MCP-over-HTTP server.
 // Requires macOS (Messages, AddressBook SQLite, osascript).
-// ENV: PORT (default 3000), MCP_API_KEY (required)
+// ENV: PORT (default 3000), MCP_API_KEY (required), BASE_PATH (optional)
 //
 // Start: MCP_API_KEY=your-secret-key PORT=3000 node http-server.js
 // Then expose with: cloudflared tunnel --url http://localhost:3000
@@ -23,6 +23,7 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
 const VERSION = '1.3.0';
 const MCP_API_KEY = process.env.MCP_API_KEY;
+const BASE_PATH = normalizeBasePath(process.env.BASE_PATH);
 
 if (!MCP_API_KEY) {
   throw new Error('Missing required env var: MCP_API_KEY');
@@ -296,12 +297,19 @@ function requireBearer(req, res, next) {
   next();
 }
 
+function normalizeBasePath(value) {
+  if (!value || value === '/') return '';
+  const trimmed = value.trim().replace(/^\/+|\/+$/g, '');
+  return trimmed ? `/${trimmed}` : '';
+}
+
 const app = express();
 const transports = new Map();
+const router = express.Router();
 app.use(express.json({ limit: '10mb' }));
-app.get('/healthz', (_req, res) => res.json({ ok: true, name: 'imessage-mcp', version: VERSION }));
-app.use('/mcp', requireBearer);
-app.post('/mcp', async (req, res) => {
+router.get('/healthz', (_req, res) => res.json({ ok: true, name: 'imessage-mcp', version: VERSION }));
+router.use('/mcp', requireBearer);
+router.post('/mcp', async (req, res) => {
   const sessionId = req.headers['mcp-session-id'];
   if (sessionId && transports.has(sessionId)) { await transports.get(sessionId).handleRequest(req, res, req.body); return; }
   if (!sessionId && isInitializeRequest(req.body)) {
@@ -314,6 +322,8 @@ app.post('/mcp', async (req, res) => {
   }
   res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Invalid session' }, id: null });
 });
-app.get('/mcp', async (req, res) => { const s = req.headers['mcp-session-id']; if (s && transports.has(s)) { await transports.get(s).handleRequest(req, res); return; } res.status(400).send('Invalid session'); });
-app.delete('/mcp', async (req, res) => { const s = req.headers['mcp-session-id']; if (s && transports.has(s)) { await transports.get(s).handleRequest(req, res); return; } res.status(400).send('Invalid session'); });
-app.listen(PORT, HOST, () => { console.log(`imessage-mcp HTTP server listening on ${HOST}:${PORT}/mcp`); });
+router.get('/mcp', async (req, res) => { const s = req.headers['mcp-session-id']; if (s && transports.has(s)) { await transports.get(s).handleRequest(req, res); return; } res.status(400).send('Invalid session'); });
+router.delete('/mcp', async (req, res) => { const s = req.headers['mcp-session-id']; if (s && transports.has(s)) { await transports.get(s).handleRequest(req, res); return; } res.status(400).send('Invalid session'); });
+app.use(router);
+if (BASE_PATH) app.use(BASE_PATH, router);
+app.listen(PORT, HOST, () => { console.log(`imessage-mcp HTTP server listening on ${HOST}:${PORT}${BASE_PATH || ''}/mcp`); });
