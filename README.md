@@ -15,8 +15,12 @@ This server reverse-engineers Apple's `NSAttributedString` binary format to extr
 | `read_recent_messages` | Read your latest messages across all conversations |
 | `search_messages` | Full-text search across all messages, contacts, and group names |
 | `get_conversation` | Get a complete conversation thread with any contact (by name or number) |
+| `list_chats_structured` | Get chat IDs, handles, last sender, previews, and group status as JSON |
+| `get_conversation_by_chat_id` | Get a reliable structured thread by chat ID |
+| `find_outreach_followups` | Find SMS outreach threads that need follow-up review |
 | `get_attachment` | **View images and files** from messages -- Claude can see and analyze photos |
 | `send_message` | Send iMessages (with confirmation safety) |
+| `send_message_batch` | Preview and send reviewed batches with an approval token |
 | `list_recent_chats` | See your most active conversations |
 | `lookup_contact` | Find phone numbers and emails from your Contacts |
 | `react_to_message` | Add tapback reactions to messages |
@@ -86,6 +90,10 @@ Add to your `.mcp.json`:
 **"What did Mom text me today?"** -- resolves "Mom" to a phone number via your AddressBook, pulls the conversation
 
 **"Search my messages for 'flight confirmation'"** -- full-text search across all messages
+
+**"Find outreach prospects from the last 7 days who replied and need follow-up"** -- returns structured outreach candidates with risk labels
+
+**"Preview this batch of 10 follow-up texts"** -- returns exact recipients, messages, warnings, and an approval token before anything sends
 
 **"Show me the photo from message 538516"** -- returns the actual image for Claude to view and describe
 
@@ -166,8 +174,9 @@ Setup:
 3) Add MCP config entry for index.js
 Use:
 - read_recent_messages, search_messages, get_conversation
+- list_chats_structured, get_conversation_by_chat_id, find_outreach_followups
 - get_attachment for image/file analysis
-- send_message/react_to_message with explicit confirm flag
+- send_message/send_message_batch/react_to_message with explicit confirm flag
 How it works:
 - SQLite + attributedBody decoding + AppleScript actions wrapped as MCP tools
 ```

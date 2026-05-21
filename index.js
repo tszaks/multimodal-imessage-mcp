@@ -11,16 +11,18 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { DEFAULT_MAX_BATCH_SIZE, createApprovalToken, validateBatch } = require('./lib/batch');
+const { classifyConversation, normalizeText } = require('./lib/outreach');
 
 // Path to iMessage database
 const DB_PATH = path.join(os.homedir(), 'Library', 'Messages', 'chat.db');
 
 class IMessageServer {
-  constructor() {
+  constructor(options = {}) {
     this.server = new Server(
       {
         name: 'imessage-server',
-        version: '1.3.0',
+        version: '1.4.0',
       },
       {
         capabilities: {
@@ -30,6 +32,7 @@ class IMessageServer {
     );
 
     this.setupToolHandlers();
+    this.runScript = options.runScript || ((script) => execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`));
 
     // Contact cache — lazy loaded on first use
     this._contactCache = null;
@@ -69,16 +72,16 @@ class IMessageServer {
     if (pos >= buf.length || buf[pos] !== 0x2b) return null;
     pos++;
 
-    // Read length — single byte for short strings, multi-byte for longer
+    // Read length. Apple stores the extended length bytes little-endian here.
     if (pos >= buf.length) return null;
     let textLen = buf[pos];
     pos++;
 
     if (textLen === 0x81 && pos + 2 <= buf.length) {
-      textLen = (buf[pos] << 8) | buf[pos + 1];
+      textLen = buf.readUInt16LE(pos);
       pos += 2;
     } else if (textLen === 0x82 && pos + 4 <= buf.length) {
-      textLen = (buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3];
+      textLen = buf.readUInt32LE(pos);
       pos += 4;
     }
 
@@ -124,6 +127,218 @@ class IMessageServer {
       '.caf': 'audio/x-caf',
     };
     return mimeMap[ext] || 'application/octet-stream';
+  }
+
+  jsonResponse(data) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(data, null, 2),
+        },
+      ],
+    };
+  }
+
+  getChatHandles(db, chatId) {
+    const rows = db.prepare(`
+      SELECT h.ROWID as handle_rowid, h.id as handle
+      FROM chat_handle_join chj
+      JOIN handle h ON chj.handle_id = h.ROWID
+      WHERE chj.chat_id = ?
+      ORDER BY h.id
+    `).all(chatId);
+
+    return rows.map(row => ({
+      handle_rowid: row.handle_rowid,
+      handle: row.handle,
+      display_name: this.resolveHandleToName(row.handle),
+    }));
+  }
+
+  getAttachmentMap(db, messageIds) {
+    if (!messageIds.length) return {};
+    const placeholders = messageIds.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT
+        maj.message_id,
+        a.ROWID as attachment_id,
+        a.filename,
+        a.mime_type,
+        a.transfer_name,
+        a.total_bytes
+      FROM message_attachment_join maj
+      JOIN attachment a ON maj.attachment_id = a.ROWID
+      WHERE maj.message_id IN (${placeholders})
+    `).all(...messageIds);
+
+    const attachmentMap = {};
+    for (const row of rows) {
+      if (!attachmentMap[row.message_id]) attachmentMap[row.message_id] = [];
+      attachmentMap[row.message_id].push({
+        attachment_id: row.attachment_id,
+        filename: row.filename,
+        mime_type: row.mime_type,
+        transfer_name: row.transfer_name,
+        total_bytes: row.total_bytes,
+      });
+    }
+    return attachmentMap;
+  }
+
+  hydrateMessage(row, attachmentMap = {}) {
+    const handle = row.contact || row.handle || null;
+    const attachments = attachmentMap[row.ROWID] || [];
+    return {
+      message_id: String(row.ROWID),
+      date: row.date,
+      from_me: Boolean(row.is_from_me),
+      handle,
+      display_name: row.is_from_me ? 'You' : this.resolveHandleToName(handle),
+      decoded_text: this.getMessageText(row) || '',
+      has_attachments: Boolean(row.cache_has_attachments),
+      attachments,
+    };
+  }
+
+  getLastMessageForChat(db, chatId) {
+    const row = db.prepare(`
+      SELECT
+        m.ROWID,
+        m.text,
+        m.attributedBody,
+        m.is_from_me,
+        m.cache_has_attachments,
+        datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+        h.id as contact
+      FROM message m
+      LEFT JOIN handle h ON m.handle_id = h.ROWID
+      JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+      WHERE cmj.chat_id = ?
+      AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL OR m.cache_has_attachments = 1)
+      ORDER BY m.date DESC
+      LIMIT 1
+    `).get(chatId);
+    return row ? this.hydrateMessage(row) : null;
+  }
+
+  getChatDisplayName(row, handles) {
+    if (row.display_name) return row.display_name;
+    if (handles.length === 1) return handles[0].display_name || handles[0].handle;
+    if (handles.length > 1) return handles.map(handle => handle.display_name || handle.handle).join(', ');
+    return row.chat_identifier || `chat:${row.chat_id}`;
+  }
+
+  fetchChatSummaries(db, options = {}) {
+    const limit = options.limit || 20;
+    const hoursAgo = options.hours_ago || null;
+    const params = [];
+    let dateFilter = '';
+
+    if (hoursAgo) {
+      params.push(hoursAgo * 3600);
+      dateFilter = `WHERE m.date > (strftime('%s', 'now') - ? - strftime('%s', '2001-01-01')) * 1000000000`;
+    }
+
+    params.push(limit);
+    const rows = db.prepare(`
+      SELECT
+        c.ROWID as chat_id,
+        c.chat_identifier,
+        c.display_name,
+        MAX(datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime')) as last_message_date,
+        COUNT(DISTINCT m.ROWID) as message_count
+      FROM chat c
+      JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
+      JOIN message m ON cmj.message_id = m.ROWID
+      ${dateFilter}
+      GROUP BY c.ROWID
+      ORDER BY MAX(m.date) DESC
+      LIMIT ?
+    `).all(...params);
+
+    return rows.map(row => {
+      const handles = this.getChatHandles(db, row.chat_id);
+      const lastMessage = this.getLastMessageForChat(db, row.chat_id);
+      const isGroup = handles.length > 1 || String(row.chat_identifier || '').includes('chat');
+      return {
+        chat_id: row.chat_id,
+        chat_identifier: row.chat_identifier,
+        display_name: this.getChatDisplayName(row, handles),
+        handles,
+        is_group: isGroup,
+        last_message_date: row.last_message_date,
+        message_count: row.message_count,
+        last_message: lastMessage ? {
+          message_id: lastMessage.message_id,
+          date: lastMessage.date,
+          from_me: lastMessage.from_me,
+          handle: lastMessage.handle,
+          display_name: lastMessage.display_name,
+          text_preview: normalizeText(lastMessage.decoded_text).slice(0, 240),
+          has_attachments: lastMessage.has_attachments,
+        } : null,
+      };
+    });
+  }
+
+  fetchConversationDataByChatId(db, chatId, options = {}) {
+    const limit = options.limit || 100;
+    const hoursAgo = options.hours_ago || null;
+    const chat = db.prepare(`
+      SELECT ROWID as chat_id, chat_identifier, display_name
+      FROM chat
+      WHERE ROWID = ?
+    `).get(chatId);
+
+    if (!chat) return null;
+
+    const handles = this.getChatHandles(db, chatId);
+    const params = [chatId];
+    let dateFilter = '';
+    if (hoursAgo) {
+      params.push(hoursAgo * 3600);
+      dateFilter = `AND m.date > (strftime('%s', 'now') - ? - strftime('%s', '2001-01-01')) * 1000000000`;
+    }
+    params.push(limit);
+
+    const rows = db.prepare(`
+      SELECT
+        m.ROWID,
+        m.text,
+        m.attributedBody,
+        m.is_from_me,
+        m.cache_has_attachments,
+        datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+        h.id as contact
+      FROM message m
+      LEFT JOIN handle h ON m.handle_id = h.ROWID
+      JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+      WHERE cmj.chat_id = ?
+      AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL OR m.cache_has_attachments = 1)
+      ${dateFilter}
+      ORDER BY m.date DESC
+      LIMIT ?
+    `).all(...params);
+
+    const orderedRows = rows.reverse();
+    const attachmentMap = this.getAttachmentMap(
+      db,
+      orderedRows.filter(row => row.cache_has_attachments).map(row => row.ROWID)
+    );
+    const messages = orderedRows
+      .map(row => this.hydrateMessage(row, attachmentMap))
+      .filter(message => message.decoded_text.trim().length > 0 || message.attachments.length > 0);
+    const isGroup = handles.length > 1 || String(chat.chat_identifier || '').includes('chat');
+
+    return {
+      chat_id: chat.chat_id,
+      chat_identifier: chat.chat_identifier,
+      display_name: this.getChatDisplayName(chat, handles),
+      handles,
+      is_group: isGroup,
+      messages,
+    };
   }
 
   setupToolHandlers() {
@@ -194,6 +409,76 @@ class IMessageServer {
           },
         },
         {
+          name: 'list_chats_structured',
+          description: 'List recent chats as structured JSON with chat IDs, handles, last sender, last message preview, group status, and message counts.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              limit: {
+                type: 'number',
+                description: 'Number of conversations to return (default: 20)',
+                default: 20,
+              },
+              hours_ago: {
+                type: 'number',
+                description: 'Only show chats active in the last N hours (optional)',
+              },
+            },
+          },
+        },
+        {
+          name: 'get_conversation_by_chat_id',
+          description: 'Get a conversation by iMessage chat_id as structured JSON. Use chat_id from list_chats_structured or find_outreach_followups.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              chat_id: {
+                type: 'number',
+                description: 'The iMessage chat ROWID.',
+              },
+              limit: {
+                type: 'number',
+                description: 'Number of messages to retrieve (default: 100)',
+                default: 100,
+              },
+              hours_ago: {
+                type: 'number',
+                description: 'Optional: Only show messages from the last N hours.',
+              },
+            },
+            required: ['chat_id'],
+          },
+        },
+        {
+          name: 'find_outreach_followups',
+          description: 'Find SMS outreach conversations that need agent review or follow-up. Returns structured candidates with status, risk labels, and evidence snippets.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              hours_ago: {
+                type: 'number',
+                description: 'Look for outreach in the last N hours (default: 168).',
+                default: 168,
+              },
+              limit: {
+                type: 'number',
+                description: 'Number of recent chats to inspect (default: 100).',
+                default: 100,
+              },
+              max_results: {
+                type: 'number',
+                description: 'Maximum classified results to return (default: 50).',
+                default: 50,
+              },
+              outreach_terms: {
+                type: 'array',
+                description: 'Optional custom terms that mark Tyler outbound messages as site-sales outreach.',
+                items: { type: 'string' },
+              },
+            },
+          },
+        },
+        {
           name: 'send_message',
           description: 'Send an iMessage or SMS to a contact (uses AppleScript). Supports iMessage (blue bubble), SMS (green bubble), or auto-detection. IMPORTANT: Always show the user the message content and recipient before sending, and get explicit confirmation.',
           inputSchema: {
@@ -220,6 +505,50 @@ class IMessageServer {
               },
             },
             required: ['to', 'message', 'confirm'],
+          },
+        },
+        {
+          name: 'send_message_batch',
+          description: 'Preview or send a reviewed SMS/iMessage batch. Preview returns an approval token. Sending requires the same exact batch, confirm=true, and the token.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              items: {
+                type: 'array',
+                description: 'Exact messages to send.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    to: { type: 'string', description: 'Phone number or email address.' },
+                    message: { type: 'string', description: 'Exact message text to send.' },
+                    candidate_id: { type: 'string', description: 'Optional outreach candidate ID.' },
+                    risk_level: { type: 'string', description: 'Optional risk level from find_outreach_followups.' },
+                    risk_labels: {
+                      type: 'array',
+                      description: 'Optional risk labels from find_outreach_followups.',
+                      items: { type: 'string' },
+                    },
+                  },
+                  required: ['to', 'message'],
+                },
+              },
+              service: {
+                type: 'string',
+                description: 'Messaging service to use for every message. Defaults to sms.',
+                enum: ['auto', 'imessage', 'sms'],
+                default: 'sms',
+              },
+              confirm: {
+                type: 'boolean',
+                description: 'Set true only after reviewing the exact preview and approval token.',
+                default: false,
+              },
+              approval_token: {
+                type: 'string',
+                description: 'Approval token returned by the preview call.',
+              },
+            },
+            required: ['items'],
           },
         },
         {
@@ -304,8 +633,16 @@ class IMessageServer {
             return await this.searchMessages(request.params.arguments);
           case 'get_conversation':
             return await this.getConversation(request.params.arguments);
+          case 'list_chats_structured':
+            return await this.listChatsStructured(request.params.arguments);
+          case 'get_conversation_by_chat_id':
+            return await this.getConversationByChatId(request.params.arguments);
+          case 'find_outreach_followups':
+            return await this.findOutreachFollowups(request.params.arguments);
           case 'send_message':
             return await this.sendMessage(request.params.arguments);
+          case 'send_message_batch':
+            return await this.sendMessageBatch(request.params.arguments);
           case 'list_recent_chats':
             return await this.listRecentChats(request.params.arguments);
           case 'lookup_contact':
@@ -617,6 +954,7 @@ class IMessageServer {
         m.attributedBody,
         m.is_from_me,
         m.cache_has_attachments,
+        m.date as apple_date,
         datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
         h.id as contact,
         c.display_name as chat_name
@@ -637,7 +975,45 @@ class IMessageServer {
     `;
 
     const searchPattern = `%${query}%`;
-    const messages = db.prepare(searchQuery).all(searchPattern, searchPattern, searchPattern, searchPattern, limit);
+    const rowsById = new Map();
+    for (const row of db.prepare(searchQuery).all(searchPattern, searchPattern, searchPattern, searchPattern, limit)) {
+      rowsById.set(row.ROWID, row);
+    }
+
+    const decodedScanLimit = Math.max(1000, limit * 20);
+    const decodedRows = db.prepare(`
+      SELECT
+        m.ROWID,
+        m.text,
+        m.attributedBody,
+        m.is_from_me,
+        m.cache_has_attachments,
+        m.date as apple_date,
+        datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+        h.id as contact,
+        c.display_name as chat_name
+      FROM message m
+      LEFT JOIN handle h ON m.handle_id = h.ROWID
+      LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+      LEFT JOIN chat c ON cmj.chat_id = c.ROWID
+      WHERE (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
+      ORDER BY m.date DESC
+      LIMIT ?
+    `).all(decodedScanLimit);
+
+    const lowerQuery = query.toLowerCase();
+    for (const row of decodedRows) {
+      const decodedText = this.getMessageText(row) || '';
+      const haystack = `${decodedText} ${row.contact || ''} ${row.chat_name || ''}`.toLowerCase();
+      if (haystack.includes(lowerQuery)) {
+        rowsById.set(row.ROWID, row);
+      }
+      if (rowsById.size >= limit) break;
+    }
+
+    const messages = Array.from(rowsById.values())
+      .sort((a, b) => b.apple_date - a.apple_date)
+      .slice(0, limit);
     db.close();
 
     const formattedMessages = messages.map(msg => {
@@ -848,6 +1224,113 @@ class IMessageServer {
     };
   }
 
+  async listChatsStructured(args = {}) {
+    const db = this.openDatabase();
+    try {
+      const chats = this.fetchChatSummaries(db, {
+        limit: args.limit || 20,
+        hours_ago: args.hours_ago || null,
+      });
+      return this.jsonResponse({
+        tool: 'list_chats_structured',
+        hours_ago: args.hours_ago || null,
+        limit: args.limit || 20,
+        count: chats.length,
+        chats,
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  async getConversationByChatId(args = {}) {
+    const chatId = Number(args.chat_id);
+    if (!Number.isInteger(chatId) || chatId <= 0) {
+      return {
+        content: [{ type: 'text', text: 'Missing or invalid chat_id.' }],
+        isError: true,
+      };
+    }
+
+    const db = this.openDatabase();
+    try {
+      const conversation = this.fetchConversationDataByChatId(db, chatId, {
+        limit: args.limit || 100,
+        hours_ago: args.hours_ago || null,
+      });
+
+      if (!conversation) {
+        return {
+          content: [{ type: 'text', text: `No conversation found for chat_id ${chatId}.` }],
+        };
+      }
+
+      return this.jsonResponse({
+        tool: 'get_conversation_by_chat_id',
+        hours_ago: args.hours_ago || null,
+        limit: args.limit || 100,
+        conversation,
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  async findOutreachFollowups(args = {}) {
+    const hoursAgo = args.hours_ago || 168;
+    const limit = args.limit || 100;
+    const maxResults = args.max_results || 50;
+    const db = this.openDatabase();
+
+    try {
+      const chats = this.fetchChatSummaries(db, { limit, hours_ago: hoursAgo })
+        .filter(chat => !chat.is_group);
+      const results = [];
+      const summary = {
+        inspected_chats: chats.length,
+        with_outreach: 0,
+        candidate: 0,
+        negative_or_opt_out: 0,
+        unclear: 0,
+        awaiting_reply: 0,
+        already_followed_up: 0,
+      };
+
+      for (const chat of chats) {
+        const conversation = this.fetchConversationDataByChatId(db, chat.chat_id, {
+          limit: args.conversation_limit || 100,
+          hours_ago: hoursAgo,
+        });
+        if (!conversation) continue;
+
+        const classified = classifyConversation(conversation, {
+          hours_ago: hoursAgo,
+          outreach_terms: args.outreach_terms,
+        });
+        if (!classified) continue;
+
+        summary.with_outreach += 1;
+        if (Object.prototype.hasOwnProperty.call(summary, classified.status)) {
+          summary[classified.status] += 1;
+        }
+        results.push(classified);
+        if (results.length >= maxResults) break;
+      }
+
+      return this.jsonResponse({
+        tool: 'find_outreach_followups',
+        hours_ago: hoursAgo,
+        inspected_limit: limit,
+        max_results: maxResults,
+        count: results.length,
+        summary,
+        results,
+      });
+    } finally {
+      db.close();
+    }
+  }
+
   async getAttachment(args) {
     const messageId = args.message_id;
 
@@ -957,10 +1440,7 @@ class IMessageServer {
     `;
   }
 
-  async sendMessage(args) {
-    let { to, message, confirm, service = 'auto' } = args;
-
-    // Resolve contact name to phone/email if needed
+  resolveRecipient(to) {
     const looksLikeId = to.includes('@') || to.includes('+') || /^\d{7,}$/.test(to);
     if (!looksLikeId) {
       const resolved = this.resolveNameToHandleIds(to);
@@ -979,6 +1459,47 @@ class IMessageServer {
         }
       }
     }
+    return to;
+  }
+
+  sendResolvedMessage(to, message, service = 'auto') {
+    const sanitizedTo = to.replace(/["'\\]/g, '');
+    const sanitizedMessage = message.replace(/"/g, '\\"');
+
+    if (service === 'imessage') {
+      try {
+        this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
+        return { service: 'imessage', text: `iMessage sent to ${to}: "${message}"` };
+      } catch (error) {
+        throw new Error(`Failed to send iMessage: ${error.message}`);
+      }
+    }
+
+    if (service === 'sms') {
+      try {
+        this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
+        return { service: 'sms', text: `SMS sent to ${to}: "${message}"` };
+      } catch (error) {
+        throw new Error(`Failed to send SMS: ${error.message}. Make sure your iPhone is nearby and Bluetooth is on (required for SMS relay).`);
+      }
+    }
+
+    try {
+      this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
+      return { service: 'imessage', text: `iMessage sent to ${to}: "${message}"` };
+    } catch {
+      try {
+        this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
+        return { service: 'sms', text: `SMS sent to ${to}: "${message}" (sent as SMS, recipient may not have iMessage)` };
+      } catch (smsError) {
+        throw new Error(`Failed to send as iMessage or SMS: ${smsError.message}. For SMS, ensure your iPhone is nearby with Bluetooth on.`);
+      }
+    }
+  }
+
+  async sendMessage(args) {
+    let { to, message, confirm, service = 'auto' } = args;
+    to = this.resolveRecipient(to);
 
     if (!confirm) {
       const serviceLabel = service === 'sms' ? 'SMS (green bubble)' : service === 'imessage' ? 'iMessage (blue bubble)' : 'iMessage or SMS (auto)';
@@ -992,41 +1513,93 @@ class IMessageServer {
       };
     }
 
-    const sanitizedTo = to.replace(/["'\\]/g, '');
-    const sanitizedMessage = message.replace(/"/g, '\\"');
+    const sent = this.sendResolvedMessage(to, message, service);
+    return { content: [{ type: 'text', text: sent.text }] };
+  }
 
-    const runScript = (script) => execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`);
+  async sendMessageBatch(args = {}) {
+    const items = args.items || [];
+    const service = args.service || 'sms';
+    const validation = validateBatch(items, { maxItems: DEFAULT_MAX_BATCH_SIZE });
+    const approvalToken = createApprovalToken(items, service);
 
-    if (service === 'imessage') {
+    if (!validation.ok) {
+      return this.jsonResponse({
+        tool: 'send_message_batch',
+        ok: false,
+        sent: false,
+        errors: validation.errors,
+        warnings: validation.warnings,
+        max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+      });
+    }
+
+    const preview = {
+      tool: 'send_message_batch',
+      ok: true,
+      sent: false,
+      service,
+      count: items.length,
+      max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+      approval_token: approvalToken,
+      warnings: validation.warnings,
+      items: items.map((item, index) => ({
+        index: index + 1,
+        to: item.to,
+        message: item.message,
+        candidate_id: item.candidate_id || null,
+        risk_level: item.risk_level || null,
+        risk_labels: Array.isArray(item.risk_labels) ? item.risk_labels : [],
+      })),
+    };
+
+    if (!args.confirm) {
+      return this.jsonResponse(preview);
+    }
+
+    if (args.approval_token !== approvalToken) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Batch NOT sent. approval_token does not match this exact batch preview.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const sent = [];
+    for (const item of items) {
+      const to = this.resolveRecipient(item.to);
       try {
-        runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
-        return { content: [{ type: 'text', text: `iMessage sent to ${to}: "${message}"` }] };
+        const result = this.sendResolvedMessage(to, item.message, service);
+        sent.push({
+          to,
+          candidate_id: item.candidate_id || null,
+          service: result.service,
+          message: item.message,
+        });
       } catch (error) {
-        throw new Error(`Failed to send iMessage: ${error.message}`);
+        return this.jsonResponse({
+          tool: 'send_message_batch',
+          ok: false,
+          sent: false,
+          error: error.message,
+          sent_before_error: sent,
+        });
       }
     }
 
-    if (service === 'sms') {
-      try {
-        runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
-        return { content: [{ type: 'text', text: `SMS sent to ${to}: "${message}"` }] };
-      } catch (error) {
-        throw new Error(`Failed to send SMS: ${error.message}. Make sure your iPhone is nearby and Bluetooth is on (required for SMS relay).`);
-      }
-    }
-
-    // auto: try iMessage first, fall back to SMS
-    try {
-      runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
-      return { content: [{ type: 'text', text: `iMessage sent to ${to}: "${message}"` }] };
-    } catch {
-      try {
-        runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
-        return { content: [{ type: 'text', text: `SMS sent to ${to}: "${message}" (sent as SMS — recipient may not have iMessage)` }] };
-      } catch (smsError) {
-        throw new Error(`Failed to send as iMessage or SMS: ${smsError.message}. For SMS, ensure your iPhone is nearby with Bluetooth on.`);
-      }
-    }
+    return this.jsonResponse({
+      tool: 'send_message_batch',
+      ok: true,
+      sent: true,
+      service,
+      count: sent.length,
+      warnings: validation.warnings,
+      sent_items: sent,
+    });
   }
 
   async listRecentChats(args) {
@@ -1215,9 +1788,13 @@ class IMessageServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('iMessage MCP server v1.3.0 running on stdio');
+    console.error('iMessage MCP server v1.4.0 running on stdio');
   }
 }
 
-const server = new IMessageServer();
-server.run().catch(console.error);
+if (require.main === module) {
+  const server = new IMessageServer();
+  server.run().catch(console.error);
+}
+
+module.exports = { IMessageServer };
