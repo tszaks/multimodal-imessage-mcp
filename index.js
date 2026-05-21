@@ -169,13 +169,17 @@ class IMessageServer {
         },
         {
           name: 'get_conversation',
-          description: 'Get full conversation thread with a specific contact, optionally filtered by time. Shows text content and indicates attachments.',
+          description: 'Get full conversation thread with a specific contact or phone number, optionally filtered by time. Shows text content and indicates attachments.',
           inputSchema: {
             type: 'object',
             properties: {
               contact: {
                 type: 'string',
                 description: 'Contact name or phone number',
+              },
+              phone_number: {
+                type: 'string',
+                description: 'Phone number alias for contact. Kept for compatibility with clients that call this tool using phone_number.',
               },
               limit: {
                 type: 'number',
@@ -187,7 +191,6 @@ class IMessageServer {
                 description: 'Optional: Only show messages from the last N hours (e.g., 12 for last 12 hours, 24 for last day)',
               },
             },
-            required: ['contact'],
           },
         },
         {
@@ -556,7 +559,7 @@ class IMessageServer {
       LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
       LEFT JOIN chat c ON cmj.chat_id = c.ROWID
       WHERE (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
-      ${includeGroupChats ? '' : 'AND (c.chat_identifier IS NULL OR c.chat_identifier NOT LIKE "%chat%")'}
+      ${includeGroupChats ? '' : "AND (c.chat_identifier IS NULL OR c.chat_identifier NOT LIKE '%chat%')"}
       ORDER BY m.date DESC
       LIMIT ?
     `;
@@ -656,9 +659,23 @@ class IMessageServer {
   }
 
   async getConversation(args) {
-    let contact = args.contact;
+    let contact = args.contact || args.phone_number || args.phoneNumber || args.to || args.recipient;
     const limit = args.limit || 100;
     const hoursAgo = args.hours_ago || null;
+
+    if (typeof contact !== 'string' || contact.trim().length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Missing required contact. Pass contact or phone_number to get_conversation.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    contact = contact.trim();
 
     const looksLikePhoneOrEmail = contact.includes('@') || contact.includes('+') || /^\d{7,}$/.test(contact);
 
