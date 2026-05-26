@@ -19,8 +19,10 @@ This server reverse-engineers Apple's `NSAttributedString` binary format to extr
 | `get_conversation_by_chat_id` | Get a reliable structured thread by chat ID |
 | `find_outreach_followups` | Find SMS outreach threads that need follow-up review |
 | `get_attachment` | **View images and files** from messages -- Claude can see and analyze photos |
-| `send_message` | Send iMessages (with confirmation safety) |
+| `send_message` | Send iMessages or SMS/RCS with confirmation safety and optional verified fallback |
+| `detect_message_service` | Inspect a thread and recommend iMessage, SMS/RCS, or auto before sending |
 | `send_message_batch` | Preview and send reviewed batches with an approval token |
+| `list_delivery_failures` | List red-bubble send failures, pending sends, and SMS/RCS recoveries |
 | `list_recent_chats` | See your most active conversations |
 | `lookup_contact` | Find phone numbers and emails from your Contacts |
 | `react_to_message` | Add tapback reactions to messages |
@@ -95,9 +97,41 @@ Add to your `.mcp.json`:
 
 **"Preview this batch of 10 follow-up texts"** -- returns exact recipients, messages, warnings, and an approval token before anything sends
 
+**"Show recent delivery failures"** -- reports outgoing messages that Messages marked failed or pending, including whether a later SMS/RCS send recovered the thread
+
 **"Show me the photo from message 538516"** -- returns the actual image for Claude to view and describe
 
 **"Send 'Running 10 min late' to +1234567890"** -- sends an iMessage (requires confirmation)
+
+## Release Flags
+
+Release flags are opt-in through the MCP server environment:
+
+```json
+{
+  "mcpServers": {
+    "imessage": {
+      "command": "node",
+      "args": ["/path/to/multimodal-imessage-mcp/index.js"],
+      "env": {
+        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback"
+      }
+    }
+  }
+}
+```
+
+| Flag | Behavior |
+|------|----------|
+| `auto_sms_fallback` | `send_message` and `send_message_batch` verify recent outgoing rows after an auto iMessage send. If Messages marks the blue bubble failed and the recipient is phone-based, the MCP retries through SMS/RCS. |
+
+Optional tuning:
+
+```bash
+IMESSAGE_MCP_SEND_VERIFY_DELAY_MS=2500
+```
+
+This controls how long the MCP waits before checking the local Messages database for the new outgoing row.
 
 ## How It Works
 

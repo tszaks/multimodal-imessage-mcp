@@ -16,13 +16,16 @@ const { classifyConversation, normalizeText } = require('./lib/outreach');
 
 // Path to iMessage database
 const DB_PATH = path.join(os.homedir(), 'Library', 'Messages', 'chat.db');
+const SERVER_VERSION = '1.4.1';
+const RELEASE_AUTO_SMS_FALLBACK = 'auto_sms_fallback';
+const DEFAULT_SEND_VERIFY_DELAY_MS = 2500;
 
 class IMessageServer {
   constructor(options = {}) {
     this.server = new Server(
       {
         name: 'imessage-server',
-        version: '1.4.0',
+        version: SERVER_VERSION,
       },
       {
         capabilities: {
@@ -33,6 +36,10 @@ class IMessageServer {
 
     this.setupToolHandlers();
     this.runScript = options.runScript || ((script) => execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`));
+    this.releaseFlags = new Set((process.env.IMESSAGE_MCP_RELEASES || '')
+      .split(',')
+      .map(flag => flag.trim())
+      .filter(Boolean));
 
     // Contact cache — lazy loaded on first use
     this._contactCache = null;
@@ -480,7 +487,7 @@ class IMessageServer {
         },
         {
           name: 'send_message',
-          description: 'Send an iMessage or SMS to a contact (uses AppleScript). Supports iMessage (blue bubble), SMS (green bubble), or auto-detection. IMPORTANT: Always show the user the message content and recipient before sending, and get explicit confirmation.',
+          description: 'Send an iMessage or SMS/RCS to a contact (uses AppleScript). Supports iMessage (blue bubble), SMS/RCS (green bubble), or auto-detection with verified fallback when the auto_sms_fallback release flag is enabled. IMPORTANT: Always show the user the message content and recipient before sending, and get explicit confirmation.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -505,6 +512,25 @@ class IMessageServer {
               },
             },
             required: ['to', 'message', 'confirm'],
+          },
+        },
+        {
+          name: 'detect_message_service',
+          description: 'Inspect local Messages history for a recipient and recommend iMessage, SMS/RCS, or auto before sending. This is best-effort because Apple does not expose a direct preflight availability API.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              to: {
+                type: 'string',
+                description: 'Phone number, email address, or contact name.',
+              },
+              limit: {
+                type: 'number',
+                description: 'Number of recent matching outgoing messages to inspect (default: 20).',
+                default: 20,
+              },
+            },
+            required: ['to'],
           },
         },
         {
@@ -549,6 +575,30 @@ class IMessageServer {
               },
             },
             required: ['items'],
+          },
+        },
+        {
+          name: 'list_delivery_failures',
+          description: 'List recent outgoing messages that Messages marked failed, pending, or potentially recovered by SMS/RCS fallback. Use this to find red Not Delivered bubbles.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              hours_ago: {
+                type: 'number',
+                description: 'Look back this many hours (default: 24).',
+                default: 24,
+              },
+              limit: {
+                type: 'number',
+                description: 'Maximum delivery issues to return (default: 50).',
+                default: 50,
+              },
+              include_pending: {
+                type: 'boolean',
+                description: 'Include rows where Messages has not marked sent yet but error is 0 (default: true).',
+                default: true,
+              },
+            },
           },
         },
         {
@@ -641,8 +691,12 @@ class IMessageServer {
             return await this.findOutreachFollowups(request.params.arguments);
           case 'send_message':
             return await this.sendMessage(request.params.arguments);
+          case 'detect_message_service':
+            return await this.detectMessageService(request.params.arguments);
           case 'send_message_batch':
             return await this.sendMessageBatch(request.params.arguments);
+          case 'list_delivery_failures':
+            return await this.listDeliveryFailures(request.params.arguments);
           case 'list_recent_chats':
             return await this.listRecentChats(request.params.arguments);
           case 'lookup_contact':
@@ -1440,35 +1494,231 @@ class IMessageServer {
     `;
   }
 
+  releaseEnabled(flag) {
+    return this.releaseFlags.has(flag);
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  getVerifyDelayMs() {
+    const value = Number(process.env.IMESSAGE_MCP_SEND_VERIFY_DELAY_MS || DEFAULT_SEND_VERIFY_DELAY_MS);
+    if (!Number.isFinite(value) || value < 0) return DEFAULT_SEND_VERIFY_DELAY_MS;
+    return value;
+  }
+
+  normalizeHandleForCompare(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    if (trimmed.includes('@')) return trimmed.toLowerCase();
+    return this.normalizePhoneNumber(trimmed) || trimmed.toLowerCase();
+  }
+
+  isPhoneRecipient(to) {
+    return Boolean(this.normalizePhoneNumber(to));
+  }
+
   resolveRecipient(to) {
-    const looksLikeId = to.includes('@') || to.includes('+') || /^\d{7,}$/.test(to);
+    if (typeof to !== 'string' || to.trim().length === 0) {
+      throw new Error('Missing recipient.');
+    }
+
+    let resolvedTo = to.trim();
+    const looksLikeId = resolvedTo.includes('@') || resolvedTo.includes('+') || /^\d{7,}$/.test(resolvedTo);
     if (!looksLikeId) {
-      const resolved = this.resolveNameToHandleIds(to);
+      const resolved = this.resolveNameToHandleIds(resolvedTo);
       if (resolved.length > 0) {
         const db = this.openDatabase();
-        const allHandles = db.prepare('SELECT id FROM handle').all();
-        db.close();
-        for (const h of allHandles) {
-          const hn = h.id.includes('@')
-            ? h.id.toLowerCase().trim()
-            : this.normalizePhoneNumber(h.id);
-          if (hn && resolved.includes(hn)) {
-            to = h.id;
-            break;
+        try {
+          const allHandles = db.prepare('SELECT id FROM handle').all();
+          for (const h of allHandles) {
+            const hn = this.normalizeHandleForCompare(h.id);
+            if (hn && resolved.includes(hn)) {
+              resolvedTo = h.id;
+              break;
+            }
           }
+        } finally {
+          db.close();
         }
       }
     }
-    return to;
+    return resolvedTo;
+  }
+
+  runSendScript(to, message, serviceType) {
+    const sanitizedTo = to.replace(/["'\\]/g, '');
+    const sanitizedMessage = message.replace(/"/g, '\\"');
+    this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, serviceType));
+  }
+
+  getMatchingHandles(db, recipient) {
+    const normalizedRecipient = this.normalizeHandleForCompare(recipient);
+    if (!normalizedRecipient) return [];
+
+    return db.prepare('SELECT ROWID, id FROM handle').all()
+      .filter(handle => this.normalizeHandleForCompare(handle.id) === normalizedRecipient);
+  }
+
+  getMaxMessageRowId() {
+    const db = this.openDatabase();
+    try {
+      const row = db.prepare('SELECT COALESCE(MAX(ROWID), 0) as max_rowid FROM message').get();
+      return Number(row.max_rowid || 0);
+    } finally {
+      db.close();
+    }
+  }
+
+  hydrateDeliveryRow(row) {
+    if (!row) return null;
+    const text = this.getMessageText(row) || '';
+    const error = Number(row.error || 0);
+    const isSent = Number(row.is_sent || 0);
+    const isDelivered = Number(row.is_delivered || 0);
+    let deliveryStatus = 'pending';
+    if (error !== 0) {
+      deliveryStatus = 'failed';
+    } else if (isSent === 1 || isDelivered === 1) {
+      deliveryStatus = 'sent';
+    }
+
+    return {
+      message_id: String(row.ROWID),
+      guid: row.guid || null,
+      date: row.date || null,
+      apple_date: row.apple_date || null,
+      handle: row.handle || null,
+      display_name: row.handle ? this.resolveHandleToName(row.handle) : null,
+      service: row.service || null,
+      delivery_status: deliveryStatus,
+      error,
+      is_sent: isSent,
+      is_delivered: isDelivered,
+      was_downgraded: Number(row.was_downgraded || 0),
+      text,
+    };
+  }
+
+  getOutgoingStatusSince(recipient, message, minRowId) {
+    const normalizedRecipient = this.normalizeHandleForCompare(recipient);
+    const db = this.openDatabase();
+    try {
+      const rows = db.prepare(`
+        SELECT
+          m.ROWID,
+          m.guid,
+          m.text,
+          m.attributedBody,
+          m.service,
+          m.error,
+          m.is_sent,
+          m.is_delivered,
+          m.was_downgraded,
+          m.date as apple_date,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          h.id as handle
+        FROM message m
+        LEFT JOIN handle h ON m.handle_id = h.ROWID
+        WHERE m.is_from_me = 1
+          AND m.ROWID > ?
+        ORDER BY m.ROWID DESC
+        LIMIT 100
+      `).all(minRowId);
+
+      for (const row of rows) {
+        const text = this.getMessageText(row) || '';
+        if (text !== message) continue;
+        const normalizedHandle = this.normalizeHandleForCompare(row.handle || '');
+        if (!normalizedRecipient || !normalizedHandle || normalizedRecipient === normalizedHandle) {
+          return this.hydrateDeliveryRow(row);
+        }
+      }
+      return null;
+    } finally {
+      db.close();
+    }
+  }
+
+  getServiceEvidence(recipient, limit = 20) {
+    const resolvedRecipient = this.resolveRecipient(recipient);
+    const db = this.openDatabase();
+    try {
+      const handles = this.getMatchingHandles(db, resolvedRecipient);
+      const result = {
+        recipient: resolvedRecipient,
+        release_flags: Array.from(this.releaseFlags),
+        matching_handles: handles.map(handle => ({
+          handle_id: handle.ROWID,
+          handle: handle.id,
+          display_name: this.resolveHandleToName(handle.id),
+        })),
+        recommended_service: this.isPhoneRecipient(resolvedRecipient) ? 'auto' : 'imessage',
+        confidence: handles.length ? 'medium' : 'low',
+        reason: handles.length ? 'Based on recent Messages history.' : 'No prior Messages handle found. Use auto unless you know the recipient is SMS-only.',
+        recent_messages: [],
+      };
+
+      if (handles.length === 0) return result;
+
+      const placeholders = handles.map(() => '?').join(',');
+      const rows = db.prepare(`
+        SELECT
+          m.ROWID,
+          m.guid,
+          m.text,
+          m.attributedBody,
+          m.service,
+          m.error,
+          m.is_sent,
+          m.is_delivered,
+          m.was_downgraded,
+          m.is_from_me,
+          m.date as apple_date,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          h.id as handle
+        FROM message m
+        LEFT JOIN handle h ON m.handle_id = h.ROWID
+        WHERE m.handle_id IN (${placeholders})
+        ORDER BY m.date DESC
+        LIMIT ?
+      `).all(...handles.map(handle => handle.ROWID), limit);
+
+      const hydrated = rows.map(row => ({
+        ...this.hydrateDeliveryRow(row),
+        from_me: Boolean(row.is_from_me),
+      }));
+      result.recent_messages = hydrated;
+
+      const recentOutgoing = hydrated.filter(row => row.from_me);
+      const recentFailedImessage = recentOutgoing.find(row => row.service === 'iMessage' && row.delivery_status === 'failed');
+      const latestOutgoingService = recentOutgoing[0]?.service || null;
+      const hasSmsThread = hydrated.some(row => ['SMS', 'RCS'].includes(row.service));
+
+      if (this.isPhoneRecipient(resolvedRecipient) && (recentFailedImessage || ['SMS', 'RCS'].includes(latestOutgoingService) || hasSmsThread)) {
+        result.recommended_service = 'sms';
+        result.confidence = recentFailedImessage ? 'high' : 'medium';
+        result.reason = recentFailedImessage
+          ? 'Recent iMessage send failed for this handle. SMS/RCS is safer.'
+          : 'Recent thread evidence uses SMS/RCS.';
+      } else if (latestOutgoingService === 'iMessage' || hydrated.some(row => row.service === 'iMessage')) {
+        result.recommended_service = 'imessage';
+        result.confidence = 'medium';
+        result.reason = 'Recent thread evidence uses iMessage.';
+      }
+
+      return result;
+    } finally {
+      db.close();
+    }
   }
 
   sendResolvedMessage(to, message, service = 'auto') {
-    const sanitizedTo = to.replace(/["'\\]/g, '');
-    const sanitizedMessage = message.replace(/"/g, '\\"');
-
     if (service === 'imessage') {
       try {
-        this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
+        this.runSendScript(to, message, 'iMessage');
         return { service: 'imessage', text: `iMessage sent to ${to}: "${message}"` };
       } catch (error) {
         throw new Error(`Failed to send iMessage: ${error.message}`);
@@ -1477,7 +1727,7 @@ class IMessageServer {
 
     if (service === 'sms') {
       try {
-        this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
+        this.runSendScript(to, message, 'SMS');
         return { service: 'sms', text: `SMS sent to ${to}: "${message}"` };
       } catch (error) {
         throw new Error(`Failed to send SMS: ${error.message}. Make sure your iPhone is nearby and Bluetooth is on (required for SMS relay).`);
@@ -1485,11 +1735,11 @@ class IMessageServer {
     }
 
     try {
-      this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'iMessage'));
+      this.runSendScript(to, message, 'iMessage');
       return { service: 'imessage', text: `iMessage sent to ${to}: "${message}"` };
     } catch {
       try {
-        this.runScript(this.buildSendScript(sanitizedTo, sanitizedMessage, 'SMS'));
+        this.runSendScript(to, message, 'SMS');
         return { service: 'sms', text: `SMS sent to ${to}: "${message}" (sent as SMS, recipient may not have iMessage)` };
       } catch (smsError) {
         throw new Error(`Failed to send as iMessage or SMS: ${smsError.message}. For SMS, ensure your iPhone is nearby with Bluetooth on.`);
@@ -1497,23 +1747,218 @@ class IMessageServer {
     }
   }
 
+  formatSendOutcome(result, to, message) {
+    const serviceLabel = result.service === 'sms' ? 'SMS/RCS' : 'iMessage';
+    const status = result.delivery_status || 'unknown';
+    const fallback = result.fallback_from
+      ? ` Fallback used after ${result.fallback_from} reported ${result.fallback_reason || 'failure'}.`
+      : '';
+    return `${serviceLabel} ${status} to ${to}: "${message}"${fallback}`;
+  }
+
+  async sendAndVerify(to, message, service, options = {}) {
+    const scriptService = service === 'sms' ? 'SMS' : 'iMessage';
+    const minRowId = this.getMaxMessageRowId();
+
+    try {
+      this.runSendScript(to, message, scriptService);
+    } catch (error) {
+      if (options.returnFailure) {
+        return {
+          service,
+          delivery_status: 'script_failed',
+          error: error.message,
+          text: `${scriptService} send failed before Messages accepted it: ${error.message}`,
+        };
+      }
+      const suffix = service === 'sms'
+        ? ' Make sure your iPhone is nearby and Bluetooth is on for SMS relay.'
+        : '';
+      throw new Error(`Failed to send ${scriptService}: ${error.message}.${suffix}`);
+    }
+
+    await this.sleep(this.getVerifyDelayMs());
+    const status = this.getOutgoingStatusSince(to, message, minRowId);
+    const result = {
+      service,
+      delivery_status: status ? status.delivery_status : 'unknown',
+      delivery_evidence: status,
+    };
+    result.text = this.formatSendOutcome(result, to, message);
+
+    if (result.delivery_status === 'failed' && options.throwOnVerifiedFailure !== false) {
+      throw new Error(`${scriptService} send was accepted by Messages but marked Not Delivered. error=${status.error}`);
+    }
+
+    return result;
+  }
+
+  async sendResolvedMessageWithVerification(to, message, service = 'auto') {
+    if (service === 'imessage') {
+      return this.sendAndVerify(to, message, 'imessage');
+    }
+
+    if (service === 'sms') {
+      return this.sendAndVerify(to, message, 'sms');
+    }
+
+    const canUseSms = this.isPhoneRecipient(to);
+    const evidence = this.getServiceEvidence(to, 20);
+    if (canUseSms && evidence.recommended_service === 'sms') {
+      return this.sendAndVerify(to, message, 'sms');
+    }
+
+    const imessageAttempt = await this.sendAndVerify(to, message, 'imessage', {
+      throwOnVerifiedFailure: false,
+      returnFailure: true,
+    });
+
+    if (canUseSms && ['failed', 'script_failed'].includes(imessageAttempt.delivery_status)) {
+      const fallback = await this.sendAndVerify(to, message, 'sms');
+      fallback.fallback_from = 'imessage';
+      fallback.fallback_reason = imessageAttempt.delivery_status;
+      fallback.text = this.formatSendOutcome(fallback, to, message);
+      return fallback;
+    }
+
+    if (imessageAttempt.delivery_status === 'script_failed') {
+      throw new Error(`Failed to send as iMessage and recipient is not SMS-capable: ${imessageAttempt.error}`);
+    }
+
+    return imessageAttempt;
+  }
+
+  async detectMessageService(args = {}) {
+    if (typeof args.to !== 'string' || args.to.trim().length === 0) {
+      return {
+        content: [{ type: 'text', text: 'Missing required recipient: to.' }],
+        isError: true,
+      };
+    }
+
+    return this.jsonResponse({
+      tool: 'detect_message_service',
+      ...this.getServiceEvidence(args.to, args.limit || 20),
+    });
+  }
+
+  getRecoveryForDeliveryIssue(db, issue) {
+    if (!issue.handle) return null;
+    const rows = db.prepare(`
+      SELECT
+        m.ROWID,
+        m.guid,
+        m.text,
+        m.attributedBody,
+        m.service,
+        m.error,
+        m.is_sent,
+        m.is_delivered,
+        m.was_downgraded,
+        m.date as apple_date,
+        datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+        h.id as handle
+      FROM message m
+      LEFT JOIN handle h ON m.handle_id = h.ROWID
+      WHERE m.is_from_me = 1
+        AND h.id = ?
+        AND m.ROWID > ?
+      ORDER BY m.ROWID ASC
+      LIMIT 8
+    `).all(issue.handle, Number(issue.message_id));
+
+    return rows
+      .map(row => this.hydrateDeliveryRow(row))
+      .find(row => row && row.delivery_status !== 'failed' && row.service !== issue.service) || null;
+  }
+
+  async listDeliveryFailures(args = {}) {
+    const hoursAgo = Number(args.hours_ago || 24);
+    const limit = Number(args.limit || 50);
+    const includePending = args.include_pending !== false;
+    const secondsAgo = Number.isFinite(hoursAgo) && hoursAgo > 0 ? hoursAgo * 3600 : 24 * 3600;
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50;
+    const pendingClause = includePending ? 'OR (COALESCE(m.error, 0) = 0 AND COALESCE(m.is_sent, 0) = 0)' : '';
+    const db = this.openDatabase();
+
+    try {
+      const rows = db.prepare(`
+        SELECT
+          m.ROWID,
+          m.guid,
+          m.text,
+          m.attributedBody,
+          m.service,
+          m.error,
+          m.is_sent,
+          m.is_delivered,
+          m.was_downgraded,
+          m.date as apple_date,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          h.id as handle
+        FROM message m
+        LEFT JOIN handle h ON m.handle_id = h.ROWID
+        WHERE m.is_from_me = 1
+          AND m.date > (strftime('%s', 'now') - ? - strftime('%s', '2001-01-01')) * 1000000000
+          AND (COALESCE(m.error, 0) != 0 ${pendingClause})
+        ORDER BY m.date DESC
+        LIMIT ?
+      `).all(secondsAgo, safeLimit);
+
+      const issues = rows.map(row => {
+        const issue = this.hydrateDeliveryRow(row);
+        return {
+          ...issue,
+          recovered_by: this.getRecoveryForDeliveryIssue(db, issue),
+        };
+      });
+
+      return this.jsonResponse({
+        tool: 'list_delivery_failures',
+        hours_ago: hoursAgo,
+        include_pending: includePending,
+        count: issues.length,
+        issues,
+      });
+    } finally {
+      db.close();
+    }
+  }
+
   async sendMessage(args) {
     let { to, message, confirm, service = 'auto' } = args;
     to = this.resolveRecipient(to);
+    if (typeof message !== 'string' || message.trim().length === 0) {
+      return {
+        content: [{ type: 'text', text: 'Missing required message text.' }],
+        isError: true,
+      };
+    }
+    if (!['auto', 'imessage', 'sms'].includes(service)) {
+      return {
+        content: [{ type: 'text', text: 'Invalid service. Use auto, imessage, or sms.' }],
+        isError: true,
+      };
+    }
 
     if (!confirm) {
       const serviceLabel = service === 'sms' ? 'SMS (green bubble)' : service === 'imessage' ? 'iMessage (blue bubble)' : 'iMessage or SMS (auto)';
+      const releaseInfo = this.releaseEnabled(RELEASE_AUTO_SMS_FALLBACK)
+        ? '\nVerified fallback: enabled'
+        : '\nVerified fallback: disabled';
       return {
         content: [
           {
             type: 'text',
-            text: `Message NOT sent. Confirmation required.\n\nTo: ${to}\nMessage: "${message}"\nService: ${serviceLabel}\n\nTo send this message, set confirm=true.`,
+            text: `Message NOT sent. Confirmation required.\n\nTo: ${to}\nMessage: "${message}"\nService: ${serviceLabel}${releaseInfo}\n\nTo send this message, set confirm=true.`,
           },
         ],
       };
     }
 
-    const sent = this.sendResolvedMessage(to, message, service);
+    const sent = this.releaseEnabled(RELEASE_AUTO_SMS_FALLBACK)
+      ? await this.sendResolvedMessageWithVerification(to, message, service)
+      : this.sendResolvedMessage(to, message, service);
     return { content: [{ type: 'text', text: sent.text }] };
   }
 
@@ -1573,11 +2018,15 @@ class IMessageServer {
     for (const item of items) {
       const to = this.resolveRecipient(item.to);
       try {
-        const result = this.sendResolvedMessage(to, item.message, service);
+        const result = this.releaseEnabled(RELEASE_AUTO_SMS_FALLBACK)
+          ? await this.sendResolvedMessageWithVerification(to, item.message, service)
+          : this.sendResolvedMessage(to, item.message, service);
         sent.push({
           to,
           candidate_id: item.candidate_id || null,
           service: result.service,
+          delivery_status: result.delivery_status || null,
+          fallback_from: result.fallback_from || null,
           message: item.message,
         });
       } catch (error) {
@@ -1788,7 +2237,7 @@ class IMessageServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('iMessage MCP server v1.4.0 running on stdio');
+    console.error(`iMessage MCP server v${SERVER_VERSION} running on stdio`);
   }
 }
 
