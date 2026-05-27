@@ -114,7 +114,7 @@ Release flags are opt-in through the MCP server environment:
       "command": "node",
       "args": ["/path/to/multimodal-imessage-mcp/index.js"],
       "env": {
-        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback"
+        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback,cleanup_failed_imessage_after_sms_fallback"
       }
     }
   }
@@ -124,6 +124,7 @@ Release flags are opt-in through the MCP server environment:
 | Flag | Behavior |
 |------|----------|
 | `auto_sms_fallback` | `send_message` and `send_message_batch` verify recent outgoing rows after an auto iMessage send. If Messages marks the blue bubble failed and the recipient is phone-based, the MCP retries through SMS/RCS. |
+| `cleanup_failed_imessage_after_sms_fallback` | After `auto_sms_fallback` successfully retries by SMS/RCS, the MCP makes a best-effort UI cleanup pass to delete the failed blue iMessage bubble and reports whether cleanup was verified. This never mutates `chat.db` directly. |
 
 Optional tuning:
 

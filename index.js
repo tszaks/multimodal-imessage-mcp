@@ -16,8 +16,9 @@ const { classifyConversation, normalizeText } = require('./lib/outreach');
 
 // Path to iMessage database
 const DB_PATH = path.join(os.homedir(), 'Library', 'Messages', 'chat.db');
-const SERVER_VERSION = '1.4.1';
+const SERVER_VERSION = '1.4.2';
 const RELEASE_AUTO_SMS_FALLBACK = 'auto_sms_fallback';
+const RELEASE_CLEANUP_FAILED_IMESSAGE = 'cleanup_failed_imessage_after_sms_fallback';
 const DEFAULT_SEND_VERIFY_DELAY_MS = 2500;
 
 class IMessageServer {
@@ -1494,6 +1495,73 @@ class IMessageServer {
     `;
   }
 
+  escapeAppleScriptString(value) {
+    return String(value || '')
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\r?\n/g, ' ');
+  }
+
+  buildCleanupFailedMessageScript(to, message) {
+    const sanitizedTo = this.escapeAppleScriptString(to.replace(/["'\\]/g, ''));
+    const snippet = this.escapeAppleScriptString(message.replace(/\s+/g, ' ').trim().slice(0, 70));
+
+    return `
+      set targetRecipient to "${sanitizedTo}"
+      set targetSnippet to "${snippet}"
+
+      tell application "Messages" to activate
+      delay 0.2
+      open location "sms:" & targetRecipient
+      delay 0.8
+
+      tell application "System Events"
+        tell process "Messages"
+          set frontmost to true
+          delay 0.3
+          if not (exists front window) then error "Messages window not found"
+
+          set matchedElement to missing value
+          try
+            set allElements to entire contents of front window
+            repeat with candidate in allElements
+              try
+                if (role of candidate is "AXStaticText") then
+                  set candidateValue to value of candidate as text
+                  if candidateValue contains targetSnippet then
+                    set matchedElement to candidate
+                    exit repeat
+                  end if
+                end if
+              end try
+            end repeat
+          end try
+
+          if matchedElement is missing value then error "Failed message bubble not found in visible transcript"
+
+          click matchedElement
+          delay 0.2
+          key code 51
+          delay 0.4
+
+          if exists sheet 1 of front window then
+            tell sheet 1 of front window
+              if exists button "Delete" then
+                click button "Delete"
+              else if exists button "Delete Message" then
+                click button "Delete Message"
+              else
+                error "Delete confirmation button not found"
+              end if
+            end tell
+          else if exists button "Delete" of front window then
+            click button "Delete" of front window
+          end if
+        end tell
+      end tell
+    `;
+  }
+
   releaseEnabled(flag) {
     return this.releaseFlags.has(flag);
   }
@@ -1642,6 +1710,35 @@ class IMessageServer {
     }
   }
 
+  getMessageByGuid(guid) {
+    if (!guid) return null;
+    const db = this.openDatabase();
+    try {
+      const row = db.prepare(`
+        SELECT
+          m.ROWID,
+          m.guid,
+          m.text,
+          m.attributedBody,
+          m.service,
+          m.error,
+          m.is_sent,
+          m.is_delivered,
+          m.was_downgraded,
+          m.date as apple_date,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          h.id as handle
+        FROM message m
+        LEFT JOIN handle h ON m.handle_id = h.ROWID
+        WHERE m.guid = ?
+        LIMIT 1
+      `).get(guid);
+      return this.hydrateDeliveryRow(row);
+    } finally {
+      db.close();
+    }
+  }
+
   getServiceEvidence(recipient, limit = 20) {
     const resolvedRecipient = this.resolveRecipient(recipient);
     const db = this.openDatabase();
@@ -1753,7 +1850,10 @@ class IMessageServer {
     const fallback = result.fallback_from
       ? ` Fallback used after ${result.fallback_from} reported ${result.fallback_reason || 'failure'}.`
       : '';
-    return `${serviceLabel} ${status} to ${to}: "${message}"${fallback}`;
+    const cleanup = result.cleanup_failed_imessage
+      ? ` Failed iMessage cleanup: ${result.cleanup_failed_imessage.ok ? 'deleted' : 'not deleted'}.`
+      : '';
+    return `${serviceLabel} ${status} to ${to}: "${message}"${fallback}${cleanup}`;
   }
 
   async sendAndVerify(to, message, service, options = {}) {
@@ -1817,6 +1917,13 @@ class IMessageServer {
       const fallback = await this.sendAndVerify(to, message, 'sms');
       fallback.fallback_from = 'imessage';
       fallback.fallback_reason = imessageAttempt.delivery_status;
+      if (
+        fallback.delivery_status !== 'failed'
+        && imessageAttempt.delivery_status === 'failed'
+        && this.releaseEnabled(RELEASE_CLEANUP_FAILED_IMESSAGE)
+      ) {
+        fallback.cleanup_failed_imessage = await this.cleanupFailedImessageAfterSmsFallback(to, message, imessageAttempt);
+      }
       fallback.text = this.formatSendOutcome(fallback, to, message);
       return fallback;
     }
@@ -1826,6 +1933,40 @@ class IMessageServer {
     }
 
     return imessageAttempt;
+  }
+
+  async cleanupFailedImessageAfterSmsFallback(to, message, imessageAttempt) {
+    const evidence = imessageAttempt.delivery_evidence || null;
+    if (!evidence?.guid) {
+      return {
+        attempted: false,
+        ok: false,
+        reason: 'No failed iMessage GUID found to verify cleanup.',
+      };
+    }
+
+    try {
+      this.runScript(this.buildCleanupFailedMessageScript(to, message));
+      await this.sleep(600);
+      const remaining = this.getMessageByGuid(evidence.guid);
+      return {
+        attempted: true,
+        ok: !remaining,
+        method: 'messages_ui_delete',
+        failed_message_guid: evidence.guid,
+        failed_message_id: evidence.message_id || null,
+        verification: remaining ? 'failed_message_still_present' : 'failed_message_not_found',
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        ok: false,
+        method: 'messages_ui_delete',
+        failed_message_guid: evidence.guid,
+        failed_message_id: evidence.message_id || null,
+        error: error.message,
+      };
+    }
   }
 
   async detectMessageService(args = {}) {
@@ -1943,14 +2084,15 @@ class IMessageServer {
 
     if (!confirm) {
       const serviceLabel = service === 'sms' ? 'SMS (green bubble)' : service === 'imessage' ? 'iMessage (blue bubble)' : 'iMessage or SMS (auto)';
-      const releaseInfo = this.releaseEnabled(RELEASE_AUTO_SMS_FALLBACK)
-        ? '\nVerified fallback: enabled'
-        : '\nVerified fallback: disabled';
+      const releaseInfo = [
+        `Verified fallback: ${this.releaseEnabled(RELEASE_AUTO_SMS_FALLBACK) ? 'enabled' : 'disabled'}`,
+        `Failed iMessage cleanup: ${this.releaseEnabled(RELEASE_CLEANUP_FAILED_IMESSAGE) ? 'enabled' : 'disabled'}`,
+      ].join('\n');
       return {
         content: [
           {
             type: 'text',
-            text: `Message NOT sent. Confirmation required.\n\nTo: ${to}\nMessage: "${message}"\nService: ${serviceLabel}${releaseInfo}\n\nTo send this message, set confirm=true.`,
+            text: `Message NOT sent. Confirmation required.\n\nTo: ${to}\nMessage: "${message}"\nService: ${serviceLabel}\n${releaseInfo}\n\nTo send this message, set confirm=true.`,
           },
         ],
       };
@@ -2027,6 +2169,7 @@ class IMessageServer {
           service: result.service,
           delivery_status: result.delivery_status || null,
           fallback_from: result.fallback_from || null,
+          cleanup_failed_imessage: result.cleanup_failed_imessage || null,
           message: item.message,
         });
       } catch (error) {

@@ -124,3 +124,62 @@ test('send_message_batch refuses a mismatched approval token', async () => {
   assert.equal(response.isError, true);
   assert.match(response.content[0].text, /does not match/);
 });
+
+test('auto SMS fallback runs failed iMessage cleanup when release flag is enabled', async () => {
+  const server = new IMessageServer({ runScript: () => {} });
+  server.releaseFlags.add('cleanup_failed_imessage_after_sms_fallback');
+  const calls = [];
+
+  server.getServiceEvidence = () => ({ recommended_service: 'auto' });
+  server.sendAndVerify = async (to, message, service) => {
+    calls.push(service);
+    if (service === 'imessage') {
+      return {
+        service,
+        delivery_status: 'failed',
+        delivery_evidence: { guid: 'failed-guid', message_id: '42' },
+      };
+    }
+    return { service, delivery_status: 'sent' };
+  };
+  server.cleanupFailedImessageAfterSmsFallback = async (to, message, attempt) => ({
+    attempted: true,
+    ok: true,
+    failed_message_guid: attempt.delivery_evidence.guid,
+  });
+
+  const result = await server.sendResolvedMessageWithVerification('+15550000001', 'Hello', 'auto');
+
+  assert.deepEqual(calls, ['imessage', 'sms']);
+  assert.equal(result.service, 'sms');
+  assert.equal(result.fallback_from, 'imessage');
+  assert.equal(result.cleanup_failed_imessage.ok, true);
+  assert.match(result.text, /Failed iMessage cleanup: deleted/);
+});
+
+test('auto SMS fallback leaves failed iMessage alone without cleanup release flag', async () => {
+  const server = new IMessageServer({ runScript: () => {} });
+  let cleanupCalled = false;
+
+  server.getServiceEvidence = () => ({ recommended_service: 'auto' });
+  server.sendAndVerify = async (to, message, service) => {
+    if (service === 'imessage') {
+      return {
+        service,
+        delivery_status: 'failed',
+        delivery_evidence: { guid: 'failed-guid', message_id: '42' },
+      };
+    }
+    return { service, delivery_status: 'sent' };
+  };
+  server.cleanupFailedImessageAfterSmsFallback = async () => {
+    cleanupCalled = true;
+    return { attempted: true, ok: true };
+  };
+
+  const result = await server.sendResolvedMessageWithVerification('+15550000001', 'Hello', 'auto');
+
+  assert.equal(result.service, 'sms');
+  assert.equal(result.cleanup_failed_imessage, undefined);
+  assert.equal(cleanupCalled, false);
+});
