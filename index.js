@@ -11,15 +11,20 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { DEFAULT_MAX_BATCH_SIZE, createApprovalToken, validateBatch } = require('./lib/batch');
 const { classifyConversation, normalizeText } = require('./lib/outreach');
 
 // Path to iMessage database
 const DB_PATH = path.join(os.homedir(), 'Library', 'Messages', 'chat.db');
-const SERVER_VERSION = '1.4.2';
+const SERVER_VERSION = '1.5.0';
 const RELEASE_AUTO_SMS_FALLBACK = 'auto_sms_fallback';
 const RELEASE_CLEANUP_FAILED_IMESSAGE = 'cleanup_failed_imessage_after_sms_fallback';
+const RELEASE_MESSAGE_MUTATION_TOOLS = 'message_mutation_tools';
+const RELEASE_EXPERIMENTAL_MESSAGE_UI_ACTIONS = 'experimental_message_ui_actions';
 const DEFAULT_SEND_VERIFY_DELAY_MS = 2500;
+const EDIT_WINDOW_SECONDS = 15 * 60;
+const UNDO_SEND_WINDOW_SECONDS = 2 * 60;
 
 class IMessageServer {
   constructor(options = {}) {
@@ -35,12 +40,13 @@ class IMessageServer {
       }
     );
 
-    this.setupToolHandlers();
     this.runScript = options.runScript || ((script) => execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`));
     this.releaseFlags = new Set((process.env.IMESSAGE_MCP_RELEASES || '')
       .split(',')
       .map(flag => flag.trim())
       .filter(Boolean));
+    this.backupMessagesDb = options.backupMessagesDb || this.backupMessagesDb.bind(this);
+    this.setupToolHandlers();
 
     // Contact cache — lazy loaded on first use
     this._contactCache = null;
@@ -349,6 +355,366 @@ class IMessageServer {
     };
   }
 
+  disabledReleaseResponse(tool, releaseFlag) {
+    return this.jsonResponse({
+      tool,
+      ok: false,
+      error: `Tool disabled. Enable release flag "${releaseFlag}" in IMESSAGE_MCP_RELEASES.`,
+    });
+  }
+
+  mutationToolsEnabled() {
+    return this.releaseEnabled(RELEASE_MESSAGE_MUTATION_TOOLS);
+  }
+
+  experimentalUiActionsEnabled() {
+    return this.releaseEnabled(RELEASE_EXPERIMENTAL_MESSAGE_UI_ACTIONS);
+  }
+
+  parseRowIds(values, label) {
+    if (!Array.isArray(values)) {
+      throw new Error(`${label} must be an array.`);
+    }
+
+    const ids = [];
+    const seen = new Set();
+    values.forEach((value, index) => {
+      const id = Number(value);
+      if (!Number.isInteger(id) || id <= 0) {
+        throw new Error(`${label}[${index}] must be a positive integer.`);
+      }
+      if (!seen.has(id)) {
+        ids.push(id);
+        seen.add(id);
+      }
+    });
+
+    if (ids.length === 0) {
+      throw new Error(`${label} is empty.`);
+    }
+    return ids;
+  }
+
+  backupMessagesDb(actionLabel = 'mutation') {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeLabel = String(actionLabel || 'mutation').replace(/[^a-z0-9_-]+/gi, '-').replace(/^-|-$/g, '') || 'mutation';
+    const backupDir = path.join(os.homedir(), 'Library', 'Messages', 'mcp-backups');
+    fs.mkdirSync(backupDir, { recursive: true });
+
+    const copied = [];
+    for (const suffix of ['', '-wal', '-shm']) {
+      const source = `${DB_PATH}${suffix}`;
+      if (!fs.existsSync(source)) continue;
+      const target = path.join(backupDir, `chat.db${suffix}.${stamp}.${safeLabel}`);
+      fs.copyFileSync(source, target);
+      copied.push(target);
+    }
+
+    if (copied.length === 0) {
+      throw new Error(`No Messages database files found at ${DB_PATH}.`);
+    }
+
+    return {
+      backup_dir: backupDir,
+      primary_backup: copied[0],
+      files: copied,
+    };
+  }
+
+  registerMessagesDbTriggerFunctions(db) {
+    const noop = () => null;
+    const falsey = () => 0;
+    const functions = [
+      ['delete_attachment_path', noop],
+      ['before_delete_attachment_path', noop],
+      ['after_delete_message_plugin', noop],
+      ['delete_chat_background_before_deleting_chat', noop],
+      ['verify_chat', noop],
+      ['guid_for_chat', noop],
+      ['is_mic_enabled', falsey],
+    ];
+
+    for (const [name, fn] of functions) {
+      try {
+        db.function(name, { varargs: true }, fn);
+      } catch {
+        // better-sqlite3 can reject duplicate registration on reused in-memory handles.
+      }
+    }
+  }
+
+  getMessagesByIds(db, ids) {
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return db.prepare(`
+      SELECT
+        m.ROWID,
+        m.guid,
+        m.text,
+        m.attributedBody,
+        m.is_from_me,
+        m.service,
+        m.date,
+        m.handle_id,
+        h.id as handle
+      FROM message m
+      LEFT JOIN handle h ON m.handle_id = h.ROWID
+      WHERE m.ROWID IN (${placeholders})
+      ORDER BY m.ROWID
+    `).all(...ids);
+  }
+
+  getMessageRecordById(messageId) {
+    const db = this.openDatabase();
+    try {
+      const rows = this.getMessagesByIds(db, [Number(messageId)]);
+      return rows[0] || null;
+    } finally {
+      db.close();
+    }
+  }
+
+  getChatPreviewForDeletion(db, chatId) {
+    const conversation = this.fetchConversationDataByChatId(db, chatId, { limit: 1 });
+    if (!conversation) return null;
+
+    const lastMessage = this.getLastMessageForChat(db, chatId);
+    return {
+      chat_id: conversation.chat_id,
+      chat_identifier: conversation.chat_identifier,
+      display_name: conversation.display_name,
+      handles: conversation.handles,
+      is_group: conversation.is_group,
+      message_count: db.prepare('SELECT COUNT(*) as count FROM chat_message_join WHERE chat_id = ?').get(chatId).count,
+      last_message: lastMessage ? {
+        message_id: lastMessage.message_id,
+        date: lastMessage.date,
+        from_me: lastMessage.from_me,
+        display_name: lastMessage.display_name,
+        text_preview: normalizeText(lastMessage.decoded_text).slice(0, 240),
+      } : null,
+    };
+  }
+
+  createThreadDeleteApprovalToken(chatIds, previews) {
+    const canonical = {
+      action: 'delete_threads',
+      chat_ids: chatIds,
+      previews: previews.map(preview => ({
+        chat_id: preview.chat_id,
+        chat_identifier: preview.chat_identifier || null,
+        display_name: preview.display_name || null,
+        handles: (preview.handles || []).map(handle => handle.handle || '').sort(),
+        message_count: preview.message_count,
+        last_message_id: preview.last_message?.message_id || null,
+        last_message_preview: preview.last_message?.text_preview || null,
+      })),
+    };
+
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify(canonical))
+      .digest('hex')
+      .slice(0, 24);
+  }
+
+  deleteMessageRows(db, ids) {
+    const existingRows = this.getMessagesByIds(db, ids);
+    const existingIds = existingRows.map(row => row.ROWID);
+    const missingIds = ids.filter(id => !existingIds.includes(id));
+
+    if (existingIds.length > 0) {
+      const placeholders = existingIds.map(() => '?').join(',');
+      const transaction = db.transaction(() => {
+        db.prepare(`DELETE FROM message_attachment_join WHERE message_id IN (${placeholders})`).run(...existingIds);
+        this.deleteFromTableIfExists(db, 'chat_recoverable_message_join', 'message_id', existingIds);
+        db.prepare(`DELETE FROM chat_message_join WHERE message_id IN (${placeholders})`).run(...existingIds);
+        db.prepare(`DELETE FROM message WHERE ROWID IN (${placeholders})`).run(...existingIds);
+      });
+      transaction();
+    }
+
+    const remaining = this.getMessagesByIds(db, existingIds).map(row => row.ROWID);
+    return {
+      deleted_ids: existingIds.filter(id => !remaining.includes(id)),
+      missing_ids: missingIds,
+      remaining_ids: remaining,
+    };
+  }
+
+  deleteChatRows(db, chatIds) {
+    const placeholders = chatIds.map(() => '?').join(',');
+    const existing = db.prepare(`SELECT ROWID FROM chat WHERE ROWID IN (${placeholders}) ORDER BY ROWID`).all(...chatIds).map(row => row.ROWID);
+    const missing = chatIds.filter(id => !existing.includes(id));
+
+    if (existing.length > 0) {
+      const existingPlaceholders = existing.map(() => '?').join(',');
+      const transaction = db.transaction(() => {
+        db.prepare(`DELETE FROM chat WHERE ROWID IN (${existingPlaceholders})`).run(...existing);
+      });
+      transaction();
+    }
+
+    const remaining = existing.length > 0
+      ? db.prepare(`SELECT ROWID FROM chat WHERE ROWID IN (${existing.map(() => '?').join(',')})`).all(...existing).map(row => row.ROWID)
+      : [];
+    return {
+      deleted_chat_ids: existing.filter(id => !remaining.includes(id)),
+      missing_chat_ids: missing,
+      remaining_chat_ids: remaining,
+    };
+  }
+
+  deleteFromTableIfExists(db, table, column, ids) {
+    const exists = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+    if (!exists || ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`DELETE FROM ${table} WHERE ${column} IN (${placeholders})`).run(...ids);
+  }
+
+  appleDateToUnixMs(appleDate) {
+    return (Number(appleDate) / 1000000000 + Date.parse('2001-01-01T00:00:00Z') / 1000) * 1000;
+  }
+
+  validateOutgoingMutableMessage(messageId, action, maxAgeSeconds) {
+    const id = Number(messageId);
+    if (!Number.isInteger(id) || id <= 0) {
+      throw new Error('message_id must be a positive integer.');
+    }
+
+    const row = this.getMessageRecordById(id);
+    if (!row) throw new Error(`Message ${id} not found.`);
+    if (!row.is_from_me) throw new Error(`Message ${id} is incoming; ${action} only supports outgoing messages.`);
+    if (row.service !== 'iMessage') throw new Error(`Message ${id} is ${row.service || 'unknown'}; ${action} only supports iMessage.`);
+
+    const ageSeconds = (Date.now() - this.appleDateToUnixMs(row.date)) / 1000;
+    if (!Number.isFinite(ageSeconds) || ageSeconds > maxAgeSeconds) {
+      throw new Error(`Message ${id} is outside the ${action} time window.`);
+    }
+
+    const text = this.getMessageText(row) || '';
+    if (!text.trim()) throw new Error(`Message ${id} has no text to locate in Messages.`);
+    return { ...row, decoded_text: text };
+  }
+
+  getMessageUiContext(message) {
+    const db = this.openDatabase();
+    try {
+      const chats = db.prepare(`
+        SELECT cmj.chat_id
+        FROM chat_message_join cmj
+        WHERE cmj.message_id = ?
+        ORDER BY cmj.chat_id
+      `).all(message.ROWID);
+
+      if (message.handle) {
+        return {
+          recipient: message.handle,
+          chat_id: chats[0]?.chat_id || null,
+        };
+      }
+
+      for (const chat of chats) {
+        const handles = this.getChatHandles(db, chat.chat_id);
+        if (handles.length === 1) {
+          return {
+            recipient: handles[0].handle,
+            chat_id: chat.chat_id,
+          };
+        }
+      }
+
+      throw new Error(`Message ${message.ROWID} does not have a single recipient handle for UI automation.`);
+    } finally {
+      db.close();
+    }
+  }
+
+  normalizeSnippet(text) {
+    return normalizeText(text || '').slice(0, 80);
+  }
+
+  escapeAppleScriptString(value) {
+    return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  }
+
+  buildMessageUiActionScript(to, currentText, action, newText = null) {
+    const targetRecipient = this.escapeAppleScriptString(to);
+    const snippet = this.escapeAppleScriptString(this.normalizeSnippet(currentText));
+    const replacement = this.escapeAppleScriptString(newText || '');
+    const menuLabels = action === 'edit'
+      ? ['Edit', 'Edit Message']
+      : ['Undo Send'];
+    const labels = menuLabels.map(label => `"${this.escapeAppleScriptString(label)}"`).join(', ');
+
+    return `
+      set targetRecipient to "${targetRecipient}"
+      set targetSnippet to "${snippet}"
+      set replacementText to "${replacement}"
+      set actionLabels to {${labels}}
+
+      open location "sms:" & targetRecipient
+      delay 1
+
+      tell application "System Events"
+        tell process "Messages"
+          set frontmost to true
+          delay 0.5
+
+          set matchedElement to missing value
+          set allText to entire contents of window 1
+          repeat with uiElement in allText
+            try
+              if class of uiElement is static text then
+                set candidate to value of uiElement as text
+                if candidate contains targetSnippet then
+                  set matchedElement to uiElement
+                end if
+              end if
+            end try
+          end repeat
+
+          if matchedElement is missing value then error "Could not find a visible outgoing bubble containing: " & targetSnippet
+
+          try
+            perform action "AXShowMenu" of matchedElement
+          on error
+            click matchedElement
+            delay 0.1
+            key down control
+            click matchedElement
+            key up control
+          end try
+          delay 0.4
+
+          set clickedMenuItem to false
+          repeat with actionLabel in actionLabels
+            if clickedMenuItem is false then
+              try
+                click menu item (actionLabel as text) of menu 1
+                set clickedMenuItem to true
+              end try
+            end if
+          end repeat
+          if clickedMenuItem is false then error "Messages did not expose the requested menu action."
+
+          delay 0.4
+          ${action === 'edit' ? `
+          keystroke "a" using command down
+          delay 0.1
+          keystroke replacementText
+          delay 0.1
+          key code 36
+          ` : `
+          try
+            click button "Undo Send" of sheet 1 of window 1
+          end try
+          `}
+        end tell
+      end tell
+    `;
+  }
+
   setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
@@ -602,6 +968,81 @@ class IMessageServer {
             },
           },
         },
+        ...(this.mutationToolsEnabled() ? [
+          {
+            name: 'delete_messages',
+            description: 'Delete exact Messages rows by message ROWID. Requires message_mutation_tools release flag. Creates a chat.db backup before mutation. No confirmation required.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                message_ids: {
+                  type: 'array',
+                  description: 'Exact message ROWIDs to delete.',
+                  items: { type: 'string' },
+                },
+              },
+              required: ['message_ids'],
+            },
+          },
+          {
+            name: 'delete_threads',
+            description: 'Preview or delete full Messages threads by chat ROWID. Requires message_mutation_tools release flag. Preview returns one exact-batch approval token.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                chat_ids: {
+                  type: 'array',
+                  description: 'Exact chat ROWIDs to preview or delete.',
+                  items: { type: 'number' },
+                },
+                confirm: {
+                  type: 'boolean',
+                  description: 'Set true only after reviewing the exact thread delete preview.',
+                  default: false,
+                },
+                approval_token: {
+                  type: 'string',
+                  description: 'Approval token returned by preview for this exact ordered batch.',
+                },
+              },
+              required: ['chat_ids'],
+            },
+          },
+        ] : []),
+        ...(this.experimentalUiActionsEnabled() ? [
+          {
+            name: 'edit_message',
+            description: 'Experimentally edit a recent outgoing iMessage through Messages UI automation. Requires experimental_message_ui_actions release flag.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                message_id: {
+                  type: 'string',
+                  description: 'Outgoing iMessage ROWID to edit.',
+                },
+                new_text: {
+                  type: 'string',
+                  description: 'Replacement message text.',
+                },
+              },
+              required: ['message_id', 'new_text'],
+            },
+          },
+          {
+            name: 'undo_send_message',
+            description: 'Experimentally undo send for a recent outgoing iMessage through Messages UI automation. Requires experimental_message_ui_actions release flag.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                message_id: {
+                  type: 'string',
+                  description: 'Outgoing iMessage ROWID to undo send.',
+                },
+              },
+              required: ['message_id'],
+            },
+          },
+        ] : []),
         {
           name: 'list_recent_chats',
           description: 'List recent active conversations, sorted by most recent activity',
@@ -698,6 +1139,14 @@ class IMessageServer {
             return await this.sendMessageBatch(request.params.arguments);
           case 'list_delivery_failures':
             return await this.listDeliveryFailures(request.params.arguments);
+          case 'delete_messages':
+            return await this.deleteMessages(request.params.arguments);
+          case 'delete_threads':
+            return await this.deleteThreads(request.params.arguments);
+          case 'edit_message':
+            return await this.editMessage(request.params.arguments);
+          case 'undo_send_message':
+            return await this.undoSendMessage(request.params.arguments);
           case 'list_recent_chats':
             return await this.listRecentChats(request.params.arguments);
           case 'lookup_contact':
@@ -723,9 +1172,10 @@ class IMessageServer {
     });
   }
 
-  openDatabase() {
+  openDatabase(options = {}) {
     try {
-      return new Database(DB_PATH, { readonly: true });
+      const readonly = options.readonly !== false;
+      return new Database(DB_PATH, { readonly });
     } catch (error) {
       throw new Error(`Failed to open iMessage database: ${error.message}. Make sure you've granted Full Disk Access to Terminal/Claude Code.`);
     }
@@ -2064,6 +2514,159 @@ class IMessageServer {
     } finally {
       db.close();
     }
+  }
+
+  async deleteMessages(args = {}) {
+    if (!this.mutationToolsEnabled()) {
+      return this.disabledReleaseResponse('delete_messages', RELEASE_MESSAGE_MUTATION_TOOLS);
+    }
+
+    const ids = this.parseRowIds(args.message_ids, 'message_ids');
+    const db = this.openDatabase({ readonly: false });
+    try {
+      this.registerMessagesDbTriggerFunctions(db);
+      const existing = this.getMessagesByIds(db, ids).map(row => row.ROWID);
+      const backup = existing.length > 0 ? this.backupMessagesDb('delete_messages') : null;
+      const result = this.deleteMessageRows(db, ids);
+
+      return this.jsonResponse({
+        tool: 'delete_messages',
+        ok: result.remaining_ids.length === 0,
+        requested_ids: ids.map(String),
+        deleted_ids: result.deleted_ids.map(String),
+        missing_ids: result.missing_ids.map(String),
+        backup,
+        verification: {
+          remaining_ids: result.remaining_ids.map(String),
+        },
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  async deleteThreads(args = {}) {
+    if (!this.mutationToolsEnabled()) {
+      return this.disabledReleaseResponse('delete_threads', RELEASE_MESSAGE_MUTATION_TOOLS);
+    }
+
+    const chatIds = this.parseRowIds(args.chat_ids, 'chat_ids');
+    const previewDb = this.openDatabase();
+    let previews;
+    let missingChatIds;
+    let approvalToken;
+
+    try {
+      const previewById = new Map();
+      for (const chatId of chatIds) {
+        const preview = this.getChatPreviewForDeletion(previewDb, chatId);
+        if (preview) previewById.set(chatId, preview);
+      }
+      previews = chatIds.map(chatId => previewById.get(chatId)).filter(Boolean);
+      missingChatIds = chatIds.filter(chatId => !previewById.has(chatId));
+      approvalToken = this.createThreadDeleteApprovalToken(chatIds, previews);
+    } finally {
+      previewDb.close();
+    }
+
+    const preview = {
+      tool: 'delete_threads',
+      ok: true,
+      deleted: false,
+      requested_chat_ids: chatIds,
+      approval_token: approvalToken,
+      missing_chat_ids: missingChatIds,
+      threads: previews,
+    };
+
+    if (!args.confirm) {
+      return this.jsonResponse(preview);
+    }
+
+    if (args.approval_token !== approvalToken) {
+      return {
+        content: [{
+          type: 'text',
+          text: 'Threads NOT deleted. approval_token does not match this exact ordered thread preview.',
+        }],
+        isError: true,
+      };
+    }
+
+    const db = this.openDatabase({ readonly: false });
+    try {
+      this.registerMessagesDbTriggerFunctions(db);
+      const backup = previews.length > 0 ? this.backupMessagesDb('delete_threads') : null;
+      const result = this.deleteChatRows(db, chatIds);
+      return this.jsonResponse({
+        tool: 'delete_threads',
+        ok: result.remaining_chat_ids.length === 0,
+        deleted: true,
+        requested_chat_ids: chatIds,
+        deleted_chat_ids: result.deleted_chat_ids,
+        skipped_missing_chat_ids: result.missing_chat_ids,
+        backup,
+        verification: {
+          remaining_chat_ids: result.remaining_chat_ids,
+        },
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  async editMessage(args = {}) {
+    if (!this.experimentalUiActionsEnabled()) {
+      return this.disabledReleaseResponse('edit_message', RELEASE_EXPERIMENTAL_MESSAGE_UI_ACTIONS);
+    }
+
+    if (typeof args.new_text !== 'string' || args.new_text.trim().length === 0) {
+      throw new Error('new_text must be a non-empty string.');
+    }
+
+    const message = this.validateOutgoingMutableMessage(args.message_id, 'edit', EDIT_WINDOW_SECONDS);
+    const context = this.getMessageUiContext(message);
+    this.runScript(this.buildMessageUiActionScript(context.recipient, message.decoded_text, 'edit', args.new_text));
+    await this.sleep(800);
+
+    const updated = this.getMessageRecordById(message.ROWID);
+    const updatedText = updated ? this.getMessageText(updated) || '' : '';
+    if (updatedText !== args.new_text) {
+      throw new Error(`Edit verification failed for message ${message.ROWID}. Messages did not show the requested new text in chat.db.`);
+    }
+
+    return this.jsonResponse({
+      tool: 'edit_message',
+      ok: true,
+      message_id: String(message.ROWID),
+      chat_id: context.chat_id,
+      verification: 'chat_db_text_matches_new_text',
+    });
+  }
+
+  async undoSendMessage(args = {}) {
+    if (!this.experimentalUiActionsEnabled()) {
+      return this.disabledReleaseResponse('undo_send_message', RELEASE_EXPERIMENTAL_MESSAGE_UI_ACTIONS);
+    }
+
+    const message = this.validateOutgoingMutableMessage(args.message_id, 'undo-send', UNDO_SEND_WINDOW_SECONDS);
+    const context = this.getMessageUiContext(message);
+    this.runScript(this.buildMessageUiActionScript(context.recipient, message.decoded_text, 'undo_send'));
+    await this.sleep(800);
+
+    const updated = this.getMessageRecordById(message.ROWID);
+    const updatedText = updated ? this.getMessageText(updated) || '' : null;
+    if (updated && updatedText === message.decoded_text) {
+      throw new Error(`Undo-send verification failed for message ${message.ROWID}. The original message is still present in chat.db.`);
+    }
+
+    return this.jsonResponse({
+      tool: 'undo_send_message',
+      ok: true,
+      message_id: String(message.ROWID),
+      chat_id: context.chat_id,
+      verification: updated ? 'chat_db_text_changed_or_cleared' : 'message_row_removed',
+    });
   }
 
   async sendMessage(args) {

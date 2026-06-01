@@ -23,6 +23,10 @@ This server reverse-engineers Apple's `NSAttributedString` binary format to extr
 | `detect_message_service` | Inspect a thread and recommend iMessage, SMS/RCS, or auto before sending |
 | `send_message_batch` | Preview and send reviewed batches with an approval token |
 | `list_delivery_failures` | List red-bubble send failures, pending sends, and SMS/RCS recoveries |
+| `delete_messages` | Delete exact local message rows with backup-first DB cleanup |
+| `delete_threads` | Preview and delete full local threads with one exact-batch approval token |
+| `edit_message` | Experimentally edit a recent outgoing iMessage through Messages UI automation |
+| `undo_send_message` | Experimentally undo send for a recent outgoing iMessage through Messages UI automation |
 | `list_recent_chats` | See your most active conversations |
 | `lookup_contact` | Find phone numbers and emails from your Contacts |
 | `react_to_message` | Add tapback reactions to messages |
@@ -114,7 +118,7 @@ Release flags are opt-in through the MCP server environment:
       "command": "node",
       "args": ["/path/to/multimodal-imessage-mcp/index.js"],
       "env": {
-        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback,cleanup_failed_imessage_after_sms_fallback"
+        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback,cleanup_failed_imessage_after_sms_fallback,message_mutation_tools,experimental_message_ui_actions"
       }
     }
   }
@@ -125,6 +129,34 @@ Release flags are opt-in through the MCP server environment:
 |------|----------|
 | `auto_sms_fallback` | `send_message` and `send_message_batch` verify recent outgoing rows after an auto iMessage send. If Messages marks the blue bubble failed and the recipient is phone-based, the MCP retries through SMS/RCS. |
 | `cleanup_failed_imessage_after_sms_fallback` | After `auto_sms_fallback` successfully retries by SMS/RCS, the MCP makes a best-effort UI cleanup pass to delete the failed blue iMessage bubble and reports whether cleanup was verified. This never mutates `chat.db` directly. |
+| `message_mutation_tools` | Exposes `delete_messages` and `delete_threads`. These tools make a timestamped backup of `chat.db`, `chat.db-wal`, and `chat.db-shm` before direct local Messages database cleanup. `delete_messages` deletes exact message row IDs without confirmation. `delete_threads` requires one exact-batch approval token for the full requested chat ID list. |
+| `experimental_message_ui_actions` | Exposes `edit_message` and `undo_send_message`. These tools use Messages UI automation, validate that the target is a recent outgoing iMessage, and verify against `chat.db` after the action. They fail clearly when Messages does not expose the menu action or the message is outside Apple's allowed window. |
+
+### Mutation Tools
+
+`delete_messages` accepts exact message ROWIDs:
+
+```json
+{ "message_ids": ["538516", "538517"] }
+```
+
+It does not require confirmation. It reports deleted IDs, missing IDs, backup location, and any remaining rows found during verification.
+
+`delete_threads` is a two-step exact-batch flow:
+
+```json
+{ "chat_ids": [101, 102] }
+```
+
+The preview returns one `approval_token` for that ordered list and the thread metadata shown in the preview. To delete, send the same ordered `chat_ids`, `confirm: true`, and that token:
+
+```json
+{ "chat_ids": [101, 102], "confirm": true, "approval_token": "..." }
+```
+
+Changing the order, list, or token fails the request.
+
+`edit_message` and `undo_send_message` are experimental because Messages does not expose first-class AppleScript commands for those actions. They open the conversation, find the visible outgoing bubble by text snippet, use the contextual menu, then verify the result. They are intended to affect actual Messages behavior, not fake local-only DB edits.
 
 Optional tuning:
 
