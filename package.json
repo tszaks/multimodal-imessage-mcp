@@ -27,7 +27,7 @@
   "type": "commonjs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tyszakacs/multimodal-imessage-mcp"
+    "url": "https://github.com/tszaks/imessage-mcp"
   },
   "engines": {
     "node": ">=18.0.0"

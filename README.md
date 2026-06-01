@@ -48,8 +48,8 @@ When you use `get_attachment`, images are returned as base64 content blocks that
 ## Installation
 
 ```bash
-git clone https://github.com/tszaks/multimodal-imessage-mcp.git
-cd multimodal-imessage-mcp
+git clone https://github.com/tszaks/imessage-mcp.git
+cd imessage-mcp
 npm install
 ```
 
@@ -64,7 +64,7 @@ Add to your `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "imessage": {
       "command": "/opt/homebrew/bin/node",
-      "args": ["/path/to/multimodal-imessage-mcp/index.js"]
+      "args": ["/path/to/imessage-mcp/index.js"]
     }
   }
 }
@@ -81,7 +81,7 @@ Add to your `.mcp.json`:
   "mcpServers": {
     "imessage": {
       "command": "node",
-      "args": ["/path/to/multimodal-imessage-mcp/index.js"]
+      "args": ["/path/to/imessage-mcp/index.js"]
     }
   }
 }
@@ -116,7 +116,7 @@ Release flags are opt-in through the MCP server environment:
   "mcpServers": {
     "imessage": {
       "command": "node",
-      "args": ["/path/to/multimodal-imessage-mcp/index.js"],
+      "args": ["/path/to/imessage-mcp/index.js"],
       "env": {
         "IMESSAGE_MCP_RELEASES": "auto_sms_fallback,cleanup_failed_imessage_after_sms_fallback,message_mutation_tools,experimental_message_ui_actions"
       }
@@ -233,7 +233,7 @@ Then add the server to your MCP client config and grant Full Disk Access to your
 Use the copy button on this code block in GitHub.
 
 ```txt
-Repo: multimodal-imessage-mcp
+Repo: imessage-mcp
 Goal: Full iMessage MCP including attachments and send/reaction actions.
 Setup:
 1) npm install
