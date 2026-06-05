@@ -21,7 +21,9 @@ function createMessageDb() {
       is_from_me INTEGER,
       cache_has_attachments INTEGER,
       date INTEGER,
-      handle_id INTEGER
+      date_read INTEGER,
+      handle_id INTEGER,
+      service TEXT
     );
     CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
     CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
@@ -35,28 +37,83 @@ function createMessageDb() {
   `);
 
   db.prepare('INSERT INTO chat (ROWID, chat_identifier, display_name) VALUES (?, ?, ?)').run(1, '+15550000001', null);
+  db.prepare('INSERT INTO chat (ROWID, chat_identifier, display_name) VALUES (?, ?, ?)').run(2, '+15550000002', null);
+  db.prepare('INSERT INTO chat (ROWID, chat_identifier, display_name) VALUES (?, ?, ?)').run(3, '+15550000003', null);
+  db.prepare('INSERT INTO chat (ROWID, chat_identifier, display_name) VALUES (?, ?, ?)').run(4, 'chat123', 'Group Chat');
   db.prepare('INSERT INTO handle (ROWID, id) VALUES (?, ?)').run(1, '+15550000001');
+  db.prepare('INSERT INTO handle (ROWID, id) VALUES (?, ?)').run(2, '+15550000002');
+  db.prepare('INSERT INTO handle (ROWID, id) VALUES (?, ?)').run(3, '+15550000003');
+  db.prepare('INSERT INTO handle (ROWID, id) VALUES (?, ?)').run(4, '+15550000004');
   db.prepare('INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)').run(1, 1);
-  db.prepare('INSERT INTO message (ROWID, text, attributedBody, is_from_me, cache_has_attachments, date, handle_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+  db.prepare('INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)').run(2, 2);
+  db.prepare('INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)').run(3, 3);
+  db.prepare('INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)').run(4, 1);
+  db.prepare('INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)').run(4, 4);
+
+  const insertMessage = db.prepare(`
+    INSERT INTO message (ROWID, text, attributedBody, is_from_me, cache_has_attachments, date, date_read, handle_id, service)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertMessage.run(
     1,
     'I built a quick demo website for your business.',
     null,
     1,
     0,
     appleDate('2026-05-21T12:00:00Z'),
-    null
+    appleDate('2026-05-21T12:01:00Z'),
+    1,
+    'iMessage'
   );
   db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(1, 1);
-  db.prepare('INSERT INTO message (ROWID, text, attributedBody, is_from_me, cache_has_attachments, date, handle_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+  insertMessage.run(
     2,
     'How much?',
     null,
     0,
     0,
     appleDate('2026-05-21T12:05:00Z'),
-    1
+    appleDate('2026-05-21T12:06:00Z'),
+    1,
+    'iMessage'
   );
   db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(1, 2);
+  insertMessage.run(
+    3,
+    'RCS outreach',
+    null,
+    1,
+    0,
+    appleDate('2026-05-21T12:10:00Z'),
+    appleDate('2026-05-21T12:11:00Z'),
+    2,
+    'RCS'
+  );
+  db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(2, 3);
+  insertMessage.run(
+    4,
+    'SMS outreach',
+    null,
+    1,
+    0,
+    appleDate('2026-05-21T12:15:00Z'),
+    appleDate('2026-05-21T12:16:00Z'),
+    3,
+    'SMS'
+  );
+  db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(3, 4);
+  insertMessage.run(
+    5,
+    'Group outreach',
+    null,
+    1,
+    0,
+    appleDate('2026-05-21T12:20:00Z'),
+    appleDate('2026-05-21T12:21:00Z'),
+    1,
+    'iMessage'
+  );
+  db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(4, 5);
   return db;
 }
 
@@ -84,6 +141,71 @@ test('get_conversation_by_chat_id returns structured messages without phone look
   assert.equal(body.conversation.messages.length, 2);
   assert.equal(body.conversation.messages[0].decoded_text, 'I built a quick demo website for your business.');
   assert.equal(body.conversation.messages[1].from_me, false);
+  assert.equal(Object.hasOwn(body.conversation.messages[0], 'read_receipt_status'), false);
+});
+
+test('read receipts are exposed only behind release flag for eligible outgoing one-to-one iMessage and RCS messages', async () => {
+  const server = new IMessageServer({ runScript: () => {} });
+  const db = createMessageDb();
+  server.openDatabase = () => db;
+  server.resolveHandleToName = handle => handle || 'Unknown';
+  server.releaseFlags.add('read_receipts');
+
+  const response = await server.getConversationByChatId({ chat_id: 1, limit: 10 });
+  const body = JSON.parse(response.content[0].text);
+  const outgoing = body.conversation.messages[0];
+  const incoming = body.conversation.messages[1];
+
+  assert.equal(outgoing.service, 'iMessage');
+  assert.equal(outgoing.read_receipt_supported, true);
+  assert.equal(outgoing.read_receipt_status, 'read');
+  assert.equal(typeof outgoing.date_read, 'string');
+  assert.equal(outgoing.apple_date_read, appleDate('2026-05-21T12:01:00Z'));
+  assert.equal(incoming.read_receipt_supported, false);
+  assert.equal(incoming.read_receipt_status, 'unsupported');
+  assert.equal(incoming.date_read, null);
+});
+
+test('read receipts support RCS but not SMS or group chats', async () => {
+  async function readChat(chatId) {
+    const server = new IMessageServer({ runScript: () => {} });
+    const db = createMessageDb();
+    server.openDatabase = () => db;
+    server.resolveHandleToName = handle => handle || 'Unknown';
+    server.releaseFlags.add('read_receipts');
+    return JSON.parse((await server.getConversationByChatId({ chat_id: chatId, limit: 10 })).content[0].text)
+      .conversation.messages[0];
+  }
+
+  const rcs = await readChat(2);
+  const sms = await readChat(3);
+  const group = await readChat(4);
+
+  assert.equal(rcs.service, 'RCS');
+  assert.equal(rcs.read_receipt_supported, true);
+  assert.equal(rcs.read_receipt_status, 'read');
+  assert.equal(sms.service, 'SMS');
+  assert.equal(sms.read_receipt_supported, false);
+  assert.equal(sms.read_receipt_status, 'unsupported');
+  assert.equal(group.service, 'iMessage');
+  assert.equal(group.read_receipt_supported, false);
+  assert.equal(group.read_receipt_status, 'unsupported');
+});
+
+test('list_chats_structured includes last-message read receipt metadata when release flag is enabled', async () => {
+  const server = new IMessageServer({ runScript: () => {} });
+  const db = createMessageDb();
+  server.openDatabase = () => db;
+  server.resolveHandleToName = handle => handle || 'Unknown';
+  server.releaseFlags.add('read_receipts');
+
+  const response = await server.listChatsStructured({ limit: 4 });
+  const body = JSON.parse(response.content[0].text);
+  const rcsChat = body.chats.find(chat => chat.chat_id === 2);
+
+  assert.equal(rcsChat.last_message.service, 'RCS');
+  assert.equal(rcsChat.last_message.read_receipt_supported, true);
+  assert.equal(rcsChat.last_message.read_receipt_status, 'read');
 });
 
 test('send_message_batch previews then sends with a matching token and mocked sender', async () => {

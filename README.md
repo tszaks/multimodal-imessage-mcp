@@ -17,6 +17,7 @@ This server reverse-engineers Apple's `NSAttributedString` binary format to extr
 | `get_conversation` | Get a complete conversation thread with any contact (by name or number) |
 | `list_chats_structured` | Get chat IDs, handles, last sender, previews, and group status as JSON |
 | `get_conversation_by_chat_id` | Get a reliable structured thread by chat ID |
+| `read_receipts` release flag | Adds best-effort read receipt metadata for outgoing 1:1 iMessage/RCS messages |
 | `find_outreach_followups` | Find SMS outreach threads that need follow-up review |
 | `get_attachment` | **View images and files** from messages -- Claude can see and analyze photos |
 | `send_message` | Send iMessages or SMS/RCS with confirmation safety and optional verified fallback |
@@ -118,7 +119,7 @@ Release flags are opt-in through the MCP server environment:
       "command": "node",
       "args": ["/path/to/imessage-mcp/index.js"],
       "env": {
-        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback,cleanup_failed_imessage_after_sms_fallback,message_mutation_tools,experimental_message_ui_actions"
+        "IMESSAGE_MCP_RELEASES": "auto_sms_fallback,cleanup_failed_imessage_after_sms_fallback,message_mutation_tools,experimental_message_ui_actions,read_receipts"
       }
     }
   }
@@ -131,6 +132,7 @@ Release flags are opt-in through the MCP server environment:
 | `cleanup_failed_imessage_after_sms_fallback` | After `auto_sms_fallback` successfully retries by SMS/RCS, the MCP makes a best-effort UI cleanup pass to delete the failed blue iMessage bubble and reports whether cleanup was verified. This never mutates `chat.db` directly. |
 | `message_mutation_tools` | Exposes `delete_messages` and `delete_threads`. These tools make a timestamped backup of `chat.db`, `chat.db-wal`, and `chat.db-shm` before direct local Messages database cleanup. `delete_messages` deletes exact message row IDs without confirmation. `delete_threads` requires one exact-batch approval token for the full requested chat ID list. |
 | `experimental_message_ui_actions` | Exposes `edit_message` and `undo_send_message`. These tools use Messages UI automation, validate that the target is a recent outgoing iMessage, and verify against `chat.db` after the action. They fail clearly when Messages does not expose the menu action or the message is outside Apple's allowed window. |
+| `read_receipts` | Adds read receipt fields to structured conversation results and read status hints to `get_conversation` text output. Supports outgoing 1:1 iMessage and RCS rows when macOS has synced `date_read`. SMS, group chats, and inbound messages are reported as unsupported. Missing `date_read` means not read or unavailable, which can also mean receipts are disabled or not synced. |
 
 ### Mutation Tools
 

@@ -17,11 +17,12 @@ const { classifyConversation, normalizeText } = require('./lib/outreach');
 
 // Path to iMessage database
 const DB_PATH = path.join(os.homedir(), 'Library', 'Messages', 'chat.db');
-const SERVER_VERSION = '1.5.0';
+const SERVER_VERSION = '1.5.1';
 const RELEASE_AUTO_SMS_FALLBACK = 'auto_sms_fallback';
 const RELEASE_CLEANUP_FAILED_IMESSAGE = 'cleanup_failed_imessage_after_sms_fallback';
 const RELEASE_MESSAGE_MUTATION_TOOLS = 'message_mutation_tools';
 const RELEASE_EXPERIMENTAL_MESSAGE_UI_ACTIONS = 'experimental_message_ui_actions';
+const RELEASE_READ_RECEIPTS = 'read_receipts';
 const DEFAULT_SEND_VERIFY_DELAY_MS = 2500;
 const EDIT_WINDOW_SECONDS = 15 * 60;
 const UNDO_SEND_WINDOW_SECONDS = 2 * 60;
@@ -200,9 +201,41 @@ class IMessageServer {
     return attachmentMap;
   }
 
-  hydrateMessage(row, attachmentMap = {}) {
+  readReceiptsEnabled() {
+    return this.releaseEnabled(RELEASE_READ_RECEIPTS);
+  }
+
+  getReadReceiptInfo(row, context = {}) {
+    if (!this.readReceiptsEnabled()) return null;
+    const service = row.service || null;
+    const appleDateRead = Number(row.apple_date_read || 0);
+    const supported = Boolean(row.is_from_me)
+      && context.is_group !== true
+      && ['iMessage', 'RCS'].includes(service);
+
+    return {
+      service,
+      read_receipt_supported: supported,
+      read_receipt_status: supported
+        ? (appleDateRead > 0 ? 'read' : 'not_read_or_unavailable')
+        : 'unsupported',
+      date_read: supported && appleDateRead > 0 ? row.date_read || null : null,
+      apple_date_read: supported && appleDateRead > 0 ? appleDateRead : null,
+    };
+  }
+
+  formatReadReceiptSuffix(row, context = {}) {
+    const info = this.getReadReceiptInfo(row, context);
+    if (!info || !info.read_receipt_supported) return '';
+    return info.read_receipt_status === 'read'
+      ? ` [read: ${info.date_read}]`
+      : ' [read: not read or unavailable]';
+  }
+
+  hydrateMessage(row, attachmentMap = {}, context = {}) {
     const handle = row.contact || row.handle || null;
     const attachments = attachmentMap[row.ROWID] || [];
+    const readReceiptInfo = this.getReadReceiptInfo(row, context);
     return {
       message_id: String(row.ROWID),
       date: row.date,
@@ -212,18 +245,26 @@ class IMessageServer {
       decoded_text: this.getMessageText(row) || '',
       has_attachments: Boolean(row.cache_has_attachments),
       attachments,
+      ...(readReceiptInfo || {}),
     };
   }
 
-  getLastMessageForChat(db, chatId) {
+  getLastMessageForChat(db, chatId, options = {}) {
     const row = db.prepare(`
       SELECT
         m.ROWID,
         m.text,
         m.attributedBody,
         m.is_from_me,
+        m.service,
+        m.date_read as apple_date_read,
         m.cache_has_attachments,
         datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+        CASE
+          WHEN COALESCE(m.date_read, 0) > 0
+          THEN datetime(m.date_read/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime')
+          ELSE NULL
+        END as date_read,
         h.id as contact
       FROM message m
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -233,7 +274,7 @@ class IMessageServer {
       ORDER BY m.date DESC
       LIMIT 1
     `).get(chatId);
-    return row ? this.hydrateMessage(row) : null;
+    return row ? this.hydrateMessage(row, {}, { is_group: options.is_group === true }) : null;
   }
 
   getChatDisplayName(row, handles) {
@@ -273,8 +314,8 @@ class IMessageServer {
 
     return rows.map(row => {
       const handles = this.getChatHandles(db, row.chat_id);
-      const lastMessage = this.getLastMessageForChat(db, row.chat_id);
       const isGroup = handles.length > 1 || String(row.chat_identifier || '').includes('chat');
+      const lastMessage = this.getLastMessageForChat(db, row.chat_id, { is_group: isGroup });
       return {
         chat_id: row.chat_id,
         chat_identifier: row.chat_identifier,
@@ -291,6 +332,13 @@ class IMessageServer {
           display_name: lastMessage.display_name,
           text_preview: normalizeText(lastMessage.decoded_text).slice(0, 240),
           has_attachments: lastMessage.has_attachments,
+          ...(this.readReceiptsEnabled() ? {
+            service: lastMessage.service,
+            read_receipt_supported: lastMessage.read_receipt_supported,
+            read_receipt_status: lastMessage.read_receipt_status,
+            date_read: lastMessage.date_read,
+            apple_date_read: lastMessage.apple_date_read,
+          } : {}),
         } : null,
       };
     });
@@ -322,8 +370,15 @@ class IMessageServer {
         m.text,
         m.attributedBody,
         m.is_from_me,
+        m.service,
+        m.date_read as apple_date_read,
         m.cache_has_attachments,
         datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+        CASE
+          WHEN COALESCE(m.date_read, 0) > 0
+          THEN datetime(m.date_read/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime')
+          ELSE NULL
+        END as date_read,
         h.id as contact
       FROM message m
       LEFT JOIN handle h ON m.handle_id = h.ROWID
@@ -340,10 +395,10 @@ class IMessageServer {
       db,
       orderedRows.filter(row => row.cache_has_attachments).map(row => row.ROWID)
     );
-    const messages = orderedRows
-      .map(row => this.hydrateMessage(row, attachmentMap))
-      .filter(message => message.decoded_text.trim().length > 0 || message.attachments.length > 0);
     const isGroup = handles.length > 1 || String(chat.chat_identifier || '').includes('chat');
+    const messages = orderedRows
+      .map(row => this.hydrateMessage(row, attachmentMap, { is_group: isGroup }))
+      .filter(message => message.decoded_text.trim().length > 0 || message.attachments.length > 0);
 
     return {
       chat_id: chat.chat_id,
@@ -478,7 +533,7 @@ class IMessageServer {
     const conversation = this.fetchConversationDataByChatId(db, chatId, { limit: 1 });
     if (!conversation) return null;
 
-    const lastMessage = this.getLastMessageForChat(db, chatId);
+    const lastMessage = this.getLastMessageForChat(db, chatId, { is_group: conversation.is_group });
     return {
       chat_id: conversation.chat_id,
       chat_identifier: conversation.chat_identifier,
@@ -1653,12 +1708,21 @@ class IMessageServer {
         m.text,
         m.attributedBody,
         m.is_from_me,
+        m.service,
+        m.date_read as apple_date_read,
         m.cache_has_attachments,
         datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
-        h.id as contact
+        CASE
+          WHEN COALESCE(m.date_read, 0) > 0
+          THEN datetime(m.date_read/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime')
+          ELSE NULL
+        END as date_read,
+        h.id as contact,
+        c.ROWID as chat_id
       FROM message m
       LEFT JOIN handle h ON m.handle_id = h.ROWID
       JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+      JOIN chat c ON cmj.chat_id = c.ROWID
       WHERE cmj.chat_id IN (${chatIds})
       AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
       ${dateFilter}
@@ -1667,6 +1731,18 @@ class IMessageServer {
     `;
 
     const messages = db.prepare(conversationQuery).all(limit);
+    const chatGroups = new Map(chats.map(chat => [chat.chat_id, false]));
+    if (this.readReceiptsEnabled() && chats.length > 0) {
+      const handleCounts = db.prepare(`
+        SELECT chat_id, COUNT(*) as handle_count
+        FROM chat_handle_join
+        WHERE chat_id IN (${chatIds})
+        GROUP BY chat_id
+      `).all();
+      for (const row of handleCounts) {
+        chatGroups.set(row.chat_id, Number(row.handle_count || 0) > 1);
+      }
+    }
 
     // For messages with attachments, fetch attachment info
     const messageIds = messages.filter(m => m.cache_has_attachments).map(m => m.ROWID);
@@ -1711,7 +1787,8 @@ class IMessageServer {
         attachmentInfo = ` ${atts.join(' ')}`;
       }
 
-      return `[${msg.date}] ${from} (ID: ${msg.ROWID}): ${text}${attachmentInfo}`;
+      const readReceipt = this.formatReadReceiptSuffix(msg, { is_group: chatGroups.get(msg.chat_id) === true });
+      return `[${msg.date}] ${from} (ID: ${msg.ROWID}): ${text}${attachmentInfo}${readReceipt}`;
     }).filter(line => {
       // Filter out empty messages with no attachments
       const match = line.match(/\(ID: \d+\): (.*)$/);

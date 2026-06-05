@@ -27,6 +27,7 @@ function createTempMessagesDb() {
       is_from_me INTEGER,
       cache_has_attachments INTEGER,
       date INTEGER,
+      date_read INTEGER,
       handle_id INTEGER,
       service TEXT
     );
@@ -50,14 +51,14 @@ function createTempMessagesDb() {
   db.prepare('INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)').run(2, 2);
 
   const insertMessage = db.prepare(`
-    INSERT INTO message (ROWID, guid, text, attributedBody, is_from_me, cache_has_attachments, date, handle_id, service)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO message (ROWID, guid, text, attributedBody, is_from_me, cache_has_attachments, date, date_read, handle_id, service)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  insertMessage.run(10, 'guid-10', 'Original outbound', null, 1, 0, appleDateFromNow(30), 1, 'iMessage');
-  insertMessage.run(11, 'guid-11', 'Incoming reply', null, 0, 0, appleDateFromNow(20), 1, 'iMessage');
-  insertMessage.run(12, 'guid-12', 'Old outbound', null, 1, 0, appleDateFromNow(3600), 1, 'iMessage');
-  insertMessage.run(13, 'guid-13', 'SMS outbound', null, 1, 0, appleDateFromNow(30), 1, 'SMS');
-  insertMessage.run(20, 'guid-20', 'Second chat message', null, 1, 0, appleDateFromNow(10), 2, 'iMessage');
+  insertMessage.run(10, 'guid-10', 'Original outbound', null, 1, 0, appleDateFromNow(30), 0, 1, 'iMessage');
+  insertMessage.run(11, 'guid-11', 'Incoming reply', null, 0, 0, appleDateFromNow(20), 0, 1, 'iMessage');
+  insertMessage.run(12, 'guid-12', 'Old outbound', null, 1, 0, appleDateFromNow(3600), 0, 1, 'iMessage');
+  insertMessage.run(13, 'guid-13', 'SMS outbound', null, 1, 0, appleDateFromNow(30), 0, 1, 'SMS');
+  insertMessage.run(20, 'guid-20', 'Second chat message', null, 1, 0, appleDateFromNow(10), 0, 2, 'iMessage');
 
   db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(1, 10);
   db.prepare('INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)').run(1, 11);
