@@ -43,7 +43,8 @@ When you use `get_attachment`, images are returned as base64 content blocks that
 ## Requirements
 
 - **macOS** (this reads the local iMessage database)
-- **Node.js** >= 18
+- **Node.js** >= 18 and < 26. Node 24 LTS is recommended because the locked
+  native SQLite dependency is not compatible with Node 26.
 - **Full Disk Access** granted to your terminal app (System Settings > Privacy & Security > Full Disk Access). This covers both the iMessage database and the AddressBook database used for contact name resolution — no need to have the Contacts app running.
 
 ## Installation
